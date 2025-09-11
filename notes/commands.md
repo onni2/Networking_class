@@ -1,0 +1,2 @@
+- nmcli dev wifi ---Check if your Wi-Fi uses strong encryption:
+- arp -a - You can see who is connected to your network:
