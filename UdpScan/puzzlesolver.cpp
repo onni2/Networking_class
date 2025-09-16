@@ -9,22 +9,23 @@
 // for the S.E.C.R.E.T port
 char* generateSecretMessage(uint32_t secret_num, const char* users, size_t& out_len) {
     size_t users_len = std::strlen(users);
-    out_len = 1 + 4 + users_len; // 5 bytes S + 4 bytes secret + users
+    out_len = 1 + 4 + users_len; // 1 byte 'S' + 4 bytes secret + usernames
 
-    char* msg = new char[out_len]; // dynamically allocate
+    char* msg = new char[out_len];
 
-    // First 5 bytes = 'S'
-    std::memset(msg, 'S', 1);
+    // First byte = 'S'
+    msg[0] = 'S';
 
     // Next 4 bytes = secret in network byte order
     uint32_t secret_net = htonl(secret_num);
-    std::memcpy(msg + 5, &secret_net, 4);
+    std::memcpy(msg + 1, &secret_net, 4);
 
-    // Remaining bytes = users
-    std::memcpy(msg + 9, users, users_len);
+    // Remaining bytes = usernames
+    std::memcpy(msg + 5, users, users_len);
 
     return msg;
 }
+
 
 // using for readability
 std::string splitter = "\n==========================================================================";
@@ -54,7 +55,7 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg
 int main(int argc, char* argv[]){
 
 	uint32_t secret_num = 0x00816BF2;
-    const char* users = "odinns24@ru.is,thorvardur23@ru.is,thora23@ru.is";
+    const char* users = "odinns24,thorvardur23,thora23";
     size_t msg_len;
 
 	if (argc != 7){
