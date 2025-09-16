@@ -5,7 +5,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
-
+// we got 53 00 81 6B F2 6F 64 69 6E 6E 73 32 34 2C 74 68 6F 72 76 61 72 64 75 72 32 33 2C 74 68 6F 72 61 32 33 
+// 5-byte message, where the first byte is your group ID and the remaining 4 bytes are a 32 bit challenge number (in network byte order) ^
 // for the S.E.C.R.E.T port
 char* generateSecretMessage(uint32_t secret_num, const char* users, size_t& out_len) {
     size_t users_len = std::strlen(users);
@@ -46,11 +47,53 @@ void handlePort3(int sock, sockaddr_in& target, bool mode) {
     sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target));
 }
 
-void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg, size_t msg_len) {
+void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg, size_t msg_len, uint32_t secret_num) {
+    // Step 2: send initial secret message
     const char* msg = mode ? secret_msg : "123456";
     size_t len = mode ? msg_len : strlen(msg);
-    sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target));
+    if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
+        perror("sendto failed");
+        return;
+    }
+
+    // Step 3: receive 5-byte challenge (1-byte group ID + 4-byte challenge)
+    char response[5];
+    socklen_t sender_len = sizeof(target);
+    ssize_t recv_bytes = recvfrom(sock, response, sizeof(response), 0, (sockaddr*)&target, &sender_len);
+    if (recv_bytes != 5) {
+        std::cerr << "Invalid challenge length received\n";
+        return;
+    }
+
+    // Step 4: extract challenge and compute XOR signature
+    uint32_t challenge;
+    std::memcpy(&challenge, response + 1, 4);
+    challenge = ntohl(challenge);
+    uint32_t signature = secret_num ^ challenge;
+    uint32_t signature_net = htonl(signature);
+
+    // Step 5: send 5-byte signature (group ID + signature)
+    char sig_msg[5];
+    sig_msg[0] = response[0]; // group ID
+    std::memcpy(sig_msg + 1, &signature_net, 4);
+    if (sendto(sock, sig_msg, 5, 0, (sockaddr*)&target, sender_len) < 0) {
+        perror("sendto failed");
+        return;
+    }
+
+    // Step 6: receive final secret port message
+    char secret_port[1024];
+    recv_bytes = recvfrom(sock, secret_port, sizeof(secret_port), 0, (sockaddr*)&target, &sender_len);
+    if (recv_bytes < 0) {
+        perror("recvfrom failed or timed out");
+        return;
+    }
+
+    std::cout << "Received secret port message:\n"
+              << std::string(secret_port, recv_bytes) << std::endl;
 }
+	
+
 
 int main(int argc, char* argv[]){
 
@@ -97,7 +140,7 @@ int main(int argc, char* argv[]){
         if (i == 0) handlePort1(sock, target, mode);
         else if (i == 1) handlePort2(sock, target, mode);
         else if (i == 2) handlePort3(sock, target, mode);
-        else if (i == 3) handleSecretPort(sock, target, mode, secret_msg, msg_len);
+        else if (i == 3) handleSecretPort(sock, target, mode, secret_msg, msg_len, secret_num);
 		socklen_t len = sizeof(target);
 		int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &len);
 		
