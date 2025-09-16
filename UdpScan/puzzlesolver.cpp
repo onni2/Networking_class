@@ -53,8 +53,8 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg
 
 int main(int argc, char* argv[]){
 
-	uint32_t secret_num = 8481778;
-    const char* users = "odinns24";
+	uint32_t secret_num = 0x00816BF2;
+    const char* users = "odinns24@ru.is,thorvardur23@ru.is,thora23@ru.is";
     size_t msg_len;
 
 	if (argc != 7){
