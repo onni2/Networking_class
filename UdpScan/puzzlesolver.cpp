@@ -8,6 +8,9 @@
 // we got 53 00 81 6B F2 6F 64 69 6E 6E 73 32 34 2C 74 68 6F 72 76 61 72 64 75 72 32 33 2C 74 68 6F 72 61 32 33 
 // 5-byte message, where the first byte is your group ID and the remaining 4 bytes are a 32 bit challenge number (in network byte order) ^
 // for the S.E.C.R.E.T port
+
+char signature[5]; 
+
 char* generateSecretMessage(uint32_t secret_num, const char* users, size_t& out_len) {
     size_t users_len = std::strlen(users);
     out_len = 1 + 4 + users_len; // 1 byte 'S' + 4 bytes secret + usernames
@@ -37,23 +40,31 @@ void handlePort1(int sock, sockaddr_in& target, bool mode) {
     sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target));
 }
 
-void handlePort2(int sock, sockaddr_in& target, bool mode) {
-    const char* msg = mode ? "ping2" : "123456";
-    sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target));
+void handlePort2(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
+    if (!mode) {
+        const char* fallback = "123456";
+        msg = fallback;
+        msg_len = strlen(fallback);
+    }
+    sendto(sock, msg, msg_len, 0, (sockaddr*)&target, sizeof(target));
 }
 
-void handlePort3(int sock, sockaddr_in& target, bool mode) {
-    const char* msg = mode ? "ping3" : "123456";
-    sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target));
+void handlePort3(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
+    if (!mode) {
+        const char* fallback = "123456";
+        msg = fallback;
+        msg_len = strlen(fallback);
+    }
+    sendto(sock, msg, msg_len, 0, (sockaddr*)&target, sizeof(target));
 }
 
-void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg, size_t msg_len, uint32_t secret_num) {
+char handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg, size_t msg_len, uint32_t secret_num) {
     // Step 2: send initial secret message
     const char* msg = mode ? secret_msg : "123456";
     size_t len = mode ? msg_len : strlen(msg);
     if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
         perror("sendto failed");
-        return;
+        return -1;
     }
 
     // Step 3: receive 5-byte challenge (1-byte group ID + 4-byte challenge)
@@ -62,7 +73,7 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg
     ssize_t recv_bytes = recvfrom(sock, response, sizeof(response), 0, (sockaddr*)&target, &sender_len);
     if (recv_bytes != 5) {
         std::cerr << "Invalid challenge length received\n";
-        return;
+        return -1;
     }
 
     // Step 4: extract challenge and compute XOR signature
@@ -78,7 +89,7 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg
     std::memcpy(sig_msg + 1, &signature_net, 4);
     if (sendto(sock, sig_msg, 5, 0, (sockaddr*)&target, sender_len) < 0) {
         perror("sendto failed");
-        return;
+        return -1;
     }
 
     // Step 6: receive final secret port message
@@ -86,13 +97,15 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, char* secret_msg
     recv_bytes = recvfrom(sock, secret_port, sizeof(secret_port), 0, (sockaddr*)&target, &sender_len);
     if (recv_bytes < 0) {
         perror("recvfrom failed or timed out");
-        return;
+        return -1;
     }
 
     std::cout << "Received secret port message:\n"
               << std::string(secret_port, recv_bytes) << std::endl;
+	std::cout << std::endl;
+	return *sig_msg;
 }
-	
+
 
 
 int main(int argc, char* argv[]){
@@ -133,14 +146,13 @@ int main(int argc, char* argv[]){
 	inet_pton(AF_INET, ipaddr, &target.sin_addr);
 
 	char buffer[1024];
+	char* signiture;
 	for (size_t i = 0; i < o_ports.size(); ++i) {
         target.sin_port = htons(o_ports[i]);
 
         // Call the correct function depending on index
-        if (i == 0) handlePort1(sock, target, mode);
-        else if (i == 1) handlePort2(sock, target, mode);
-        else if (i == 2) handlePort3(sock, target, mode);
-        else if (i == 3) handleSecretPort(sock, target, mode, secret_msg, msg_len, secret_num);
+        if (i == 0) *signiture = handleSecretPort(sock, target, mode, secret_msg, msg_len, secret_num);
+        else if (i == 1) handlePort2(sock, target, mode, signiture, 5);
 		socklen_t len = sizeof(target);
 		int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &len);
 		
