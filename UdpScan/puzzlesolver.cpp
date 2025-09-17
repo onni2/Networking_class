@@ -46,8 +46,7 @@ void handlePortPingOrPassword(int sock, sockaddr_in& target, bool mode) {
     }
 }
 
-void handlePortWithMessage(int sock, sockaddr_in& target, bool mode,
-                           const char* msg, size_t msg_len) {
+void handlePortWithMessage(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
     const char* payload = mode ? msg : "123456";
     size_t len = mode ? msg_len : strlen(payload);
 
@@ -55,17 +54,31 @@ void handlePortWithMessage(int sock, sockaddr_in& target, bool mode,
         die("sendto failed");
     }
 }
+void handleEvilPort(int sock, sockaddr_in& target, const uint8_t sig[4]) {
+    // Just send the 4-byte signature payload
+    sendto(sock, sig, 4, 0, (sockaddr*)&target, sizeof(target));
 
-void handleSecretPort(int sock, sockaddr_in& target, bool mode,
-                      const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
+    // Receive reply immediately
+    char buf[1024];
+    socklen_t len = sizeof(target);
+    int n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&target, &len);
+    if(n > 0) {
+        std::cout << "Evil port replied: " << std::string(buf, n) << "\n";
+    } else {
+        perror("recvfrom failed or timed out");
+    }
+}
+
+
+
+void handleSecretPort(int sock, sockaddr_in& target, bool mode, const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
     // Step 2: send initial secret message
     const char* msg = mode ? reinterpret_cast<const char*>(secret_msg.data()) : "123456";
     size_t len = mode ? secret_msg.size() : strlen(msg);
-
     if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
-
+	if (mode == false){return;}
     // Step 3: receive 5-byte challenge
     char response[5];
     socklen_t sender_len = sizeof(target);
@@ -154,6 +167,9 @@ int main(int argc, char* argv[]) {
         } else if (i == 1) {
             const char* signature = sig_msg + 1; // 4-byte signature
             handlePortWithMessage(sock, target, mode, signature, 4);
+        }else if (i == 2) {
+            uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88}; // your S.E.C.R.E.T7
+			handleEvilPort(sock, target, sig);
         } else {
             handlePortPingOrPassword(sock, target, mode);
         }
