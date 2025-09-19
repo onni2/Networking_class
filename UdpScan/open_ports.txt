@@ -1,0 +1,7 @@
+4053
+4011
+4032
+4090
+
+Now you can run the code with:
+./puzzlesolver 130.208.246.98 4053 4011 4032 4090 1

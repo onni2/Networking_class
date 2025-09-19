@@ -19,6 +19,15 @@ struct pseudo_udp_packet {
     char data[32]; // small payload
 };
 
+std::string extract_secret_phrase(const std::string& msg) {
+    size_t start = msg.find('"');
+    size_t end   = msg.rfind('"');
+    if (start != std::string::npos && end != std::string::npos && end > start) {
+        return msg.substr(start + 1, end - start - 1);
+    }
+    return ""; // fallback
+}
+
 // Compute UDP checksum over pseudo-header + UDP header + data
 uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
     struct pseudo_header {
@@ -281,11 +290,9 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, const std::vecto
 void send_knocks(int sock, sockaddr_in target,
                  const std::vector<int>& knock_sequence,
                  const char sig_msg[5], char* buffer,
-                 const std::string& splitter)
+                 const std::string& splitter,
+                 const std::string& phrase) // <- added
 {
-    static const std::string phrase =
-        "A fool thinks themselves to be wise, but the wise know themselves to be fools.";
-
     const uint8_t* signature = reinterpret_cast<const uint8_t*>(sig_msg + 1);
 
     for (size_t i = 0; i < knock_sequence.size(); ++i) {
@@ -302,6 +309,7 @@ void send_knocks(int sock, sockaddr_in target,
             perror("sendto failed");
             return;
         }
+
         std::cout << "Sent knock " << (i + 1) << "/" << knock_sequence.size()
                   << " to port " << port << " (" << knock.size() << " bytes)\n";
 
@@ -318,10 +326,10 @@ void send_knocks(int sock, sockaddr_in target,
             }
         } else {
             perror("recvfrom timed out or failed");
-            // Optional: retry logic could go here
         }
     }
 }
+
 
 
 
@@ -333,7 +341,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Mode 0 = send 123456, Mode 1 = send custom/secret messages\n";
         return EXIT_FAILURE;
     }
-
+    std::string phrase; // for the secret phrase later
     const char* ipaddr = argv[1];
     int port1 = atoi(argv[2]);
     int port2 = atoi(argv[3]);
@@ -378,7 +386,27 @@ int main(int argc, char* argv[]) {
         } else if (i == 1) {
             const char* signature = sig_msg + 1; // 4-byte signature
             checksum(sock, target, mode, signature, 4);
-        }else if (i == 2) {
+
+            // --- Receive the secret phrase from port 4011 ---
+            socklen_t len = sizeof(target);
+            int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &len);
+            
+            if (n > 0) {
+                std::string msg(buffer, n);
+                std::cout << splitter << "\n\nPORT " << ports[i] << " says:\n" << msg << "\n";
+
+                // Extract phrase dynamically
+                phrase = extract_secret_phrase(msg);
+
+                if (phrase.empty()) {
+                    std::cerr << "Failed to extract secret phrase!\n";
+                    return EXIT_FAILURE;
+                } else {
+                    std::cout << "Extracted secret phrase: " << phrase << "\n";
+                }
+            }
+        }
+        else if (i == 2) {
             uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88}; // your S.E.C.R.E.T7
 			handleEvilPort(sock, target, sig);
         }
@@ -413,7 +441,12 @@ int main(int argc, char* argv[]) {
         }
 
         // Send knocks in order and wait for response after each
-        send_knocks(sock, target, knock_sequence, sig_msg, buffer, splitter);
+        if (!phrase.empty()) {
+            send_knocks(sock, target, knock_sequence, sig_msg, buffer, splitter, phrase);
+        } else {
+            std::cerr << "Cannot send knocks: secret phrase missing!\n";
+            return EXIT_FAILURE;
+        }
     }
 }
 
