@@ -1,26 +1,28 @@
-# UDP Scanner Project
+# UDP Scanner and Challenge Solver Project
 
-A network programming project implementing UDP port scanning and puzzle solving with special protocol handling including RFC 3514 "Evil Bit" support.
+A comprehensive network programming project implementing UDP port discovery and automated challenge solving with advanced protocol handling including RFC 3514 "Evil Bit" support.
 
 ## Project Overview
 
-This project consists of two main components:
-- **Scanner**: A UDP port scanner that handles multiple ports with different protocols
-- **Puzzle Solver**: A utility for solving network-based puzzles and challenges
+This project consists of two complementary programs:
+- **Scanner**: Discovers and identifies challenge ports on a target server
+- **Puzzle Solver**: Automatically completes complex network challenges using extracted secrets
 
 ## Features
 
-- UDP port scanning with custom payloads
-- Secret message generation and handling
-- RFC 3514 "Evil Bit" implementation for evil port communication
-- ICMP echo request support for bonus challenges
-- Wireshark-compatible packet generation
-- Multiple operation modes
+- **Intelligent port discovery** with response pattern matching
+- **Automatic challenge identification** and port ordering
+- **Fully automated challenge solving** with secret extraction
+- **RFC 3514 "Evil Bit"** implementation for evil port communication
+- **UDP checksum manipulation** for cryptographic challenges
+- **Port knocking sequences** with signature-based authentication
+- **ICMP echo request** support for bonus challenges
+- **File output** with ready-to-run commands
 
 ## Files
 
-- `scanner.cpp` - Main UDP scanner implementation
-- `puzzlesolver.cpp` - Puzzle solving utilities
+- `scanner.cpp` - Port discovery and challenge identification
+- `puzzlesolver.cpp` - Automated challenge solver
 - `Makefile` - Build configuration
 - `README.md` - This documentation
 
@@ -30,7 +32,7 @@ This project consists of two main components:
 
 - C++ compiler with C++17+ support (g++ recommended)
 - Linux/Unix environment
-- Network permissions for raw socket operations (some features may require root)
+- Network permissions for raw socket operations (requires root for evil bit functionality)
 
 ### Compilation
 
@@ -38,7 +40,7 @@ This project consists of two main components:
 # Build all targets
 make
 
-# Build specific target
+# Build individual programs
 make scanner
 make puzzlesolver
 
@@ -51,57 +53,114 @@ make release
 
 ## Usage
 
-### Scanner
+### Step 1: Port Discovery
+
+Use the scanner to discover and identify challenge ports:
 
 ```bash
 ./scanner <IP Address> <low_port> <high_port>
 ```
 
 **Parameters:**
-- `IP Address`: Target IP address to scan
-- `low_port-high_port`: Scans from low to high (4000-4100)
+- `IP Address`: Target server IP address
+- `low_port`: Starting port number for scan range
+- `high_port`: Ending port number for scan range
 
 **Example:**
 ```bash
 ./scanner 130.208.246.98 4000 4100
 ```
 
-### Puzzle Solver
+**What it does:**
+- Scans all ports in the specified range
+- Identifies challenge ports by response patterns
+- Orders ports by challenge type (secret, checksum, evil, final)
+- Saves results to `open_ports.txt` with ready-to-run command
 
-```bash
-./puzzlesolver <IP Address> <port1> <port2> <port3> <port4> <mode> <[secret_port1, secret_port2]>
+**Expected output:**
+```
+PORT: 8001 seems OPEN
+PORT: 4011 seems OPEN  
+PORT: 8003 seems OPEN
+PORT: 8004 seems OPEN
+Saved 4 open ports and ready-to-run command in open_ports.txt
 ```
 
-## Port Handling
+### Step 2: Challenge Solving
 
-The scanner handles different ports with specialized protocols:
+Use the puzzle solver with the discovered ports:
 
-1. **Port 1 (Secret Port)**: Sends generated secret messages
-2. **Port 2 (Signature Port)**: Sends 4-byte signature payload  
-3. **Port 3 (Evil Port)**: Implements RFC 3514 "Evil Bit" for malicious packet detection
-4. **Port 4 (Last prot)**: The port for the knocks
-5. **mode** : It is a bit redundant now but i used it to print out the message. but now it is 1 always.
-
-## Special Features
-
-### RFC 3514 Evil Bit
-
-The scanner implements RFC 3514 (April Fools' RFC) for the "evil port" challenge:
-- Sets the reserved bit in IPv4 header flags field
-- Creates properly formatted malicious packets
-- Required for communication with security-conscious evil ports
-
-### Secret Message Generation
-
-Generates cryptographic secret messages using:
-- 32-bit secret numbers
-- User group information
-- Custom encoding schemes
-
-### ICMP Bonus Challenge
-
-For bonus points, send ICMP echo requests:
 ```bash
+./puzzlesolver <IP> <port1> <port2> <port3> <port4>
+```
+
+**Parameters:**
+- `IP`: Target server IP address
+- `port1-port4`: The four challenge ports in correct order
+
+**Example:**
+```bash
+./puzzlesolver 130.208.246.98 8001 4011 8003 8004
+```
+
+**Automated workflow:**
+1. **Secret Port Challenge**: Sends cryptographic secret message, extracts first secret port
+2. **Checksum Challenge**: Handles UDP checksum manipulation, extracts secret phrase
+3. **Evil Port Challenge**: Sends RFC 3514 evil bit packet, extracts second secret port
+4. **Final Challenge**: Combines extracted ports, initiates port knocking sequence
+5. **Port Knocking**: Automatically completes authentication sequence
+
+## Challenge Types Handled
+
+### 1. Secret Port (S.E.C.R.E.T Protocol)
+- Sends generated secret message with group information
+- Handles challenge-response authentication
+- Extracts first secret port number
+
+### 2. Checksum Port  
+- Manipulates UDP checksum to match server requirements
+- Sends encapsulated UDP packets with specific source IPs
+- Extracts secret phrases from server responses
+
+### 3. Evil Port (RFC 3514)
+- Implements "Evil Bit" in IPv4 header flags
+- Creates raw packets with malicious intent marking
+- Required for communication with security-conscious ports
+
+### 4. Final Port
+- Combines extracted secret ports
+- Initiates port knocking sequences
+- Handles signature-based authentication
+
+## Automatic Information Extraction
+
+The puzzle solver automatically detects and extracts:
+
+- **Secret Port Numbers**: From messages like "You have earned the right to know the port: 4079!"
+- **Secret Phrases**: From quoted text in server responses
+- **Port Knock Sequences**: From comma-separated lists in final responses
+
+## ICMP Bonus Challenge
+
+For bonus points, send ICMP echo requests with group identifiers:
+
+```bash
+ping -c 1 -p $(echo -n '$group_7' | xxd -p) 130.208.246.98
+```
+
+## Sample Workflow
+
+```bash
+# 1. Discover challenge ports
+./scanner 130.208.246.98 4000 4100
+
+# 2. Check the generated command
+cat open_ports.txt
+
+# 3. Run the challenge solver (copy command from file)
+./puzzlesolver 130.208.246.98 8001 4011 8003 8004
+
+# 4. (Optional) Send ICMP for bonus points
 ping -c 1 -p $(echo -n '$group_7' | xxd -p) 130.208.246.98
 ```
 
@@ -111,46 +170,30 @@ Use Wireshark to analyze network traffic:
 1. Capture on appropriate network interface
 2. Filter for UDP traffic: `udp`
 3. Filter for specific IP: `ip.addr == 130.208.246.98`
-4. Examine packet details for custom payloads and headers
+4. Look for custom headers (evil bit, checksums, encapsulated packets)
 
 ## Troubleshooting
 
 ### Permission Issues
 
-Some features require elevated privileges:
+Raw socket operations require elevated privileges:
 ```bash
-sudo ./scanner 130.208.246.98 8001 8002 8003 8004 1
+sudo ./puzzlesolver 130.208.246.98 8001 4011 8003 8004
 ```
 
-### Network Connectivity
+### Port Discovery Issues
 
-Test basic connectivity first:
-```bash
-ping -c 1 130.208.246.98
-```
+If scanner doesn't find 4 ports:
+- Expand search range: `./scanner 130.208.246.98 3000 5000`
+- Check network connectivity: `ping 130.208.246.98`
+- Verify target server is running
 
-### Raw Socket Issues
+### Challenge Solver Issues
 
-If raw sockets fail:
-1. Check if running as root
-2. Verify network interface permissions
-3. Check firewall/iptables rules
-
-## Development
-
-### Adding New Features
-
-1. Modify source files
-2. Update Makefile if needed
-3. Test with `make debug`
-4. Document changes
-
-### Code Style
-
-- C++17 standard
-- Consistent indentation
-- Error handling with proper cleanup
-- Network byte order conversion
+If automatic extraction fails:
+- Check server response formats in output
+- Verify all 4 challenge ports are correct
+- Ensure proper network permissions for raw sockets
 
 ## Security Notes
 
@@ -158,6 +201,14 @@ If raw sockets fail:
 - Use only on networks you own or have permission to test
 - Raw socket operations require appropriate privileges
 - Be mindful of network policies and firewalls
+
+## Group Configuration
+
+Current configuration is set for Group 7:
+- Group identifier: `$group_7`
+- Secret number: `0x00816BF2`
+- Users: `odinns24,thorvardur23,thora23`
+- Evil signature: `{0xBA, 0x5C, 0xEB, 0x88}`
 
 ## License
 
@@ -168,3 +219,4 @@ Educational project - use responsibly.
 - Group 7 implementation
 - Network Programming Course
 - UDP/ICMP Protocol Exploration
+- Advanced Raw Socket Programming

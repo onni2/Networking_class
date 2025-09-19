@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <regex>
 
 // Global for signature (kept since later ports depend on it)
 char sig_msg[5]; // 4-byte signature + group ID
@@ -28,6 +29,37 @@ std::string extract_secret_phrase(const std::string& msg) {
     if (start != std::string::npos && end != std::string::npos && end > start)
         return msg.substr(start + 1, end - start - 1);
     return "";
+}
+
+// NEW: Extract port number from server response
+int extract_port_number(const std::string& msg) {
+    // Look for patterns like "port: 4079" or "secret port: 4058"
+    std::regex port_regex(R"(port:\s*(\d+))");
+    std::smatch match;
+    
+    if (std::regex_search(msg, match, port_regex)) {
+        return std::stoi(match[1].str());
+    }
+    
+    // Alternative pattern: "port 4079" or similar
+    std::regex alt_regex(R"(port\s+(\d+))");
+    if (std::regex_search(msg, match, alt_regex)) {
+        return std::stoi(match[1].str());
+    }
+    
+    // Pattern for "secret port: \n4058" (with possible newline)
+    std::regex secret_regex(R"(secret port[:\s]*\s*(\d+))");
+    if (std::regex_search(msg, match, secret_regex)) {
+        return std::stoi(match[1].str());
+    }
+    
+    // More general pattern: any sequence of digits after "port"
+    std::regex general_regex(R"(port[^0-9]*(\d+))");
+    if (std::regex_search(msg, match, general_regex)) {
+        return std::stoi(match[1].str());
+    }
+    
+    return -1; // Not found
 }
 
 void printHex(const std::vector<uint8_t>& data) {
@@ -72,13 +104,11 @@ int recv_from_socket(int sock, sockaddr_in& target, char* buffer, size_t bufsize
     return recvfrom(sock, buffer, bufsize, 0, (sockaddr*)&target, &len);
 }
 
-
 struct pseudo_udp_packet {
     iphdr ip;
     udphdr udp;
     char data[32]; // small payload
 };
-
 
 // Compute UDP checksum over pseudo-header + UDP header + data
 uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
@@ -161,19 +191,15 @@ void send_fake_udp(int sock, sockaddr_in& server, uint16_t target_checksum, cons
 }
 
 // Port handlers
-void getFinalPort(int sock, sockaddr_in& target, bool mode, const char* combined) {
-    const char* msg = mode ? combined : "123456";
-    if (sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target)) < 0) {
+void getFinalPort(int sock, sockaddr_in& target, const char* combined) {
+    if (sendto(sock, combined, strlen(combined), 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
 }
 
-void checksum(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
-    const char* payload = mode ? msg : "123456";
-    size_t len = mode ? msg_len : strlen(payload);
-
+void checksum(int sock, sockaddr_in& target, const char* msg, size_t msg_len) {
     // send message
-    if (sendto(sock, payload, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
+    if (sendto(sock, msg, msg_len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
 
@@ -211,9 +237,7 @@ void checksum(int sock, sockaddr_in& target, bool mode, const char* msg, size_t 
     }
 }
 
-
-
-void handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
+int handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
     // 1. Get the local IP and port of the normal UDP socket
     sockaddr_in local{};
     socklen_t len = sizeof(local);
@@ -252,25 +276,22 @@ void handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
     socklen_t slen = sizeof(target);
     int n = recvfrom(udpSock, buf, sizeof(buf), 0, (sockaddr*)&target, &slen);
     if (n > 0) {
-        std::cout << "Evil port replied: " << std::string(buf, n) << "\n";
+        std::string msg(buf, n);
+        std::cout << "Evil port replied: " << msg << "\n";
+        return extract_port_number(msg);
     } else {
         perror("recvfrom failed or timed out");
+        return -1;
     }
 }
 
-
-
-void handleSecretPort(int sock, sockaddr_in& target, bool mode, const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
-    const char* msg = mode ? reinterpret_cast<const char*>(secret_msg.data()) : "123456";
-    size_t len = mode ? secret_msg.size() : strlen(msg);
-
-    if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) die("sendto failed");
-    if (!mode) return;
+int handleSecretPort(int sock, sockaddr_in& target, const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
+    if (sendto(sock, secret_msg.data(), secret_msg.size(), 0, (sockaddr*)&target, sizeof(target)) < 0) die("sendto failed");
 
     char response[5];
     socklen_t slen = sizeof(target);
     ssize_t n = recvfrom(sock, response, sizeof(response), 0, (sockaddr*)&target, &slen);
-    if (n != 5) { std::cerr << "Invalid challenge length\n"; return; }
+    if (n != 5) { std::cerr << "Invalid challenge length\n"; return -1; }
 
     uint32_t challenge;
     std::memcpy(&challenge, response + 1, 4);
@@ -286,15 +307,15 @@ void handleSecretPort(int sock, sockaddr_in& target, bool mode, const std::vecto
 
     char secret_port[MAX_BUFFER];
     n = recvfrom(sock, secret_port, sizeof(secret_port), 0, (sockaddr*)&target, &slen);
-    if (n > 0) std::cout << "Received secret port message:\n" << std::string(secret_port, n) << "\n";
-    else perror("recvfrom timed out");
+    if (n > 0) {
+        std::string msg(secret_port, n);
+        std::cout << "Received secret port message:\n" << msg << "\n";
+        return extract_port_number(msg);
+    } else {
+        perror("recvfrom timed out");
+        return -1;
+    }
 }
-// Assumes:
-// - sock is your UDP socket (int) with SO_RCVTIMEO already set
-// - target is a sockaddr_in with sin_family and sin_addr already set
-// - sig_msg is char sig_msg[5] where sig_msg[1..4] are your 4-byte signature
-// - secret_ports is a vector<int> containing the ports you want to knock
-// - buffer and splitter are available like in your program
 
 void send_knocks(int sock, sockaddr_in target,
                  const std::vector<int>& knock_sequence,
@@ -336,23 +357,20 @@ void send_knocks(int sock, sockaddr_in target,
     }
 }
 
-
-
-
-
-
-
 int main(int argc, char* argv[]) {
-    if (argc != 7 && argc != 9) {
-        std::cout << "Usage: ./scanner <IP> <port1> <port2> <port3> <port4> <mode> [extra args]\n";
-        std::cout << "Mode 0 = send 123456, Mode 1 = send custom/secret messages\n";
+    if (argc != 6) {
+        std::cout << "Usage: ./scanner <IP> <port1> <port2> <port3> <port4>\n";
+        std::cout << "Automated challenge solver for UDP port sequences\n";
         return EXIT_FAILURE;
     }
 
     const char* ipaddr = argv[1];
-    int mode = atoi(argv[6]);
     std::vector<int> ports = {atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5])};
+    
+    // Variables to store extracted information
     std::string phrase; // secret phrase from port 2
+    int secret_port1 = -1; // port from secret port response  
+    int secret_port2 = -1; // port from evil port response
 
     uint32_t secret_num = 0x00816BF2;
     std::string users = "odinns24,thorvardur23,thora23";
@@ -367,44 +385,66 @@ int main(int argc, char* argv[]) {
     char buffer[1024];
     std::string splitter = "\n==============================================================\n";
 
-    // First 4 ports
+    // Process the first 4 ports and extract information
     for (size_t i = 0; i < ports.size(); ++i) {
         target.sin_port = htons(ports[i]);
 
-        if (i == 0) handleSecretPort(sock, target, mode, secret_msg, secret_num);
+        if (i == 0) {
+            // Secret port
+            secret_port1 = handleSecretPort(sock, target, secret_msg, secret_num);
+            if (secret_port1 != -1) {
+                std::cout << "*** EXTRACTED SECRET PORT 1: " << secret_port1 << " ***\n";
+            }
+        }
         else if (i == 1) {
+            // Checksum port  
             const char* signature = sig_msg + 1;
-            checksum(sock, target, mode, signature, 4);
+            checksum(sock, target, signature, 4);
 
             int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
             if (n > 0) {
                 std::string msg(buffer, n);
                 std::cout << splitter << "PORT " << ports[i] << " says:\n" << msg << "\n";
 
+                // Extract secret phrase
                 phrase = extract_secret_phrase(msg);
-                if (phrase.empty()) {
+                if (!phrase.empty()) {
+                    std::cout << "*** EXTRACTED SECRET PHRASE: \"" << phrase << "\" ***\n";
+                } else {
                     std::cerr << "Failed to extract secret phrase!\n";
-                    return EXIT_FAILURE;
                 }
             }
         }
         else if (i == 2) {
+            // Evil port
             uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88};
-            handleEvilPort(sock, target, sig);
+            secret_port2 = handleEvilPort(sock, target, sig);
+            if (secret_port2 != -1) {
+                std::cout << "*** EXTRACTED SECRET PORT 2: " << secret_port2 << " ***\n";
+            }
         }
-
-        int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
-        if (n > 0)
-            std::cout << splitter << "PORT " << ports[i] << " says:\n" << std::string(buffer, n) << "\n";
+        else {
+            // Regular port
+            int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
+            if (n > 0) {
+                std::cout << splitter << "PORT " << ports[i] << " says:\n" << std::string(buffer, n) << "\n";
+            }
+        }
     }
 
-    // Optional last port (argc == 9)
-    if (argc == 9) {
+    // Now automatically proceed with the final challenge if we have everything
+    if (secret_port1 != -1 && secret_port2 != -1 && !phrase.empty()) {
+        std::cout << "\n*** PROCEEDING WITH FINAL CHALLENGE ***\n";
+        std::cout << "Using secret ports: " << secret_port1 << ", " << secret_port2 << "\n";
+        std::cout << "Using secret phrase: \"" << phrase << "\"\n\n";
+        
+        // Create the combined message for the final port
         char combined[64];
-        snprintf(combined, sizeof(combined), "%s,%s", argv[7], argv[8]);
+        snprintf(combined, sizeof(combined), "%d,%d", secret_port1, secret_port2);
+        
+        // Send to the last port to get knock sequence
         target.sin_port = htons(ports[3]);
-
-        getFinalPort(sock, target, mode, combined);
+        getFinalPort(sock, target, combined);
 
         int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
         if (n > 0) {
@@ -416,17 +456,29 @@ int main(int argc, char* argv[]) {
             std::stringstream ss(reply);
             std::string token;
             while (std::getline(ss, token, ',')) {
-                knock_sequence.push_back(std::stoi(token));
+                try {
+                    knock_sequence.push_back(std::stoi(token));
+                } catch (const std::exception& e) {
+                    // Skip invalid tokens
+                    continue;
+                }
             }
 
-            // Only send knocks if we have the secret phrase
-            if (!phrase.empty())
+            if (!knock_sequence.empty()) {
+                std::cout << "\n*** STARTING PORT KNOCKING SEQUENCE ***\n";
                 send_knocks(sock, target, knock_sequence, sig_msg, buffer, splitter, phrase);
-            else {
-                std::cerr << "Cannot send knocks: secret phrase missing!\n";
-                return EXIT_FAILURE;
+            } else {
+                std::cerr << "No valid knock sequence found in response!\n";
             }
+        } else {
+            std::cerr << "No response from final port!\n";
         }
+    } else {
+        std::cout << "\n*** MISSING REQUIRED INFORMATION ***\n";
+        std::cout << "Secret port 1: " << (secret_port1 == -1 ? "NOT FOUND" : std::to_string(secret_port1)) << "\n";
+        std::cout << "Secret port 2: " << (secret_port2 == -1 ? "NOT FOUND" : std::to_string(secret_port2)) << "\n";
+        std::cout << "Secret phrase: " << (phrase.empty() ? "NOT FOUND" : "\"" + phrase + "\"") << "\n";
+        std::cout << "Cannot proceed with final challenge.\n";
     }
 
     close(sock);
