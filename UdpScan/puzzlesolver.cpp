@@ -1,16 +1,76 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <iostream>
+#include <vector>
 #include <string>
+#include <sstream>
+#include <fstream>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <vector>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <sstream>
+
 // Global for signature (kept since later ports depend on it)
-char sig_msg[5];
+char sig_msg[5]; // 4-byte signature + group ID
+constexpr size_t MAX_BUFFER = 1024;
+constexpr int TIMEOUT_SEC = 1;
+
+ // Utility functions
+void die(const std::string &msg) {
+    perror(msg.c_str());
+    exit(EXIT_FAILURE);
+}
+
+std::string extract_secret_phrase(const std::string& msg) {
+    size_t start = msg.find('"');
+    size_t end   = msg.rfind('"');
+    if (start != std::string::npos && end != std::string::npos && end > start)
+        return msg.substr(start + 1, end - start - 1);
+    return "";
+}
+
+void printHex(const std::vector<uint8_t>& data) {
+    for (uint8_t b : data) printf("%02X ", b);
+    printf("\n");
+}
+
+std::vector<uint8_t> generateSecretMessage(uint32_t secret_num, const std::string& users) {
+    std::vector<uint8_t> msg;
+    msg.reserve(1 + 4 + users.size());
+    msg.push_back('S'); 
+    uint32_t secret_net = htonl(secret_num);
+    msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&secret_net), reinterpret_cast<uint8_t*>(&secret_net) + 4);
+    msg.insert(msg.end(), users.begin(), users.end());
+    return msg;
+}
+
+// Networking helpers
+int create_udp_socket() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) die("socket failed");
+
+    timeval tv{};
+    tv.tv_sec = TIMEOUT_SEC;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+        die("setsockopt failed");
+
+    return sock;
+}
+
+sockaddr_in build_target(const char* ipaddr, int port = 0) {
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ipaddr, &target.sin_addr) <= 0)
+        die("inet_pton failed");
+    if (port > 0) target.sin_port = htons(port);
+    return target;
+}
+
+int recv_from_socket(int sock, sockaddr_in& target, char* buffer, size_t bufsize) {
+    socklen_t len = sizeof(target);
+    return recvfrom(sock, buffer, bufsize, 0, (sockaddr*)&target, &len);
+}
 
 
 struct pseudo_udp_packet {
@@ -19,14 +79,6 @@ struct pseudo_udp_packet {
     char data[32]; // small payload
 };
 
-std::string extract_secret_phrase(const std::string& msg) {
-    size_t start = msg.find('"');
-    size_t end   = msg.rfind('"');
-    if (start != std::string::npos && end != std::string::npos && end > start) {
-        return msg.substr(start + 1, end - start - 1);
-    }
-    return ""; // fallback
-}
 
 // Compute UDP checksum over pseudo-header + UDP header + data
 uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
@@ -106,34 +158,6 @@ void send_fake_udp(int sock, sockaddr_in& server, uint16_t target_checksum, cons
                   << std::hex << target_checksum
                   << " and src=" << src_ip << std::dec << "\n";
     }
-}
-
-// Helper: print error and exit
-void die(const std::string& msg) {
-    perror(msg.c_str());
-    exit(EXIT_FAILURE);
-}
-
-// Helper: print hex for debugging
-void printHex(const std::vector<uint8_t>& data) {
-    for (uint8_t b : data) {
-        printf("%02X ", b);
-    }
-    printf("\n");
-}
-
-// Construct secret message (S + secret_num + usernames)
-std::vector<uint8_t> generateSecretMessage(uint32_t secret_num, const std::string& users) {
-    std::vector<uint8_t> msg;
-    msg.reserve(1 + 4 + users.size());
-
-    msg.push_back('S'); // first byte
-    uint32_t secret_net = htonl(secret_num);
-    const uint8_t* ptr = reinterpret_cast<uint8_t*>(&secret_net);
-    msg.insert(msg.end(), ptr, ptr + 4);
-    msg.insert(msg.end(), users.begin(), users.end());
-
-    return msg;
 }
 
 // Port handlers
@@ -237,49 +261,34 @@ void handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
 
 
 void handleSecretPort(int sock, sockaddr_in& target, bool mode, const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
-    // Step 2: send initial secret message
     const char* msg = mode ? reinterpret_cast<const char*>(secret_msg.data()) : "123456";
     size_t len = mode ? secret_msg.size() : strlen(msg);
-    if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
-        die("sendto failed");
-    }
-	if (mode == false){return;}
-    // Step 3: receive 5-byte challenge
-    char response[5];
-    socklen_t sender_len = sizeof(target);
-    ssize_t recv_bytes = recvfrom(sock, response, sizeof(response), 0,
-                                  (sockaddr*)&target, &sender_len);
-    if (recv_bytes != 5) {
-        std::cerr << "Invalid challenge length received\n";
-        return;
-    }
 
-    // Step 4: extract challenge and compute XOR signature
+    if (sendto(sock, msg, len, 0, (sockaddr*)&target, sizeof(target)) < 0) die("sendto failed");
+    if (!mode) return;
+
+    char response[5];
+    socklen_t slen = sizeof(target);
+    ssize_t n = recvfrom(sock, response, sizeof(response), 0, (sockaddr*)&target, &slen);
+    if (n != 5) { std::cerr << "Invalid challenge length\n"; return; }
+
     uint32_t challenge;
     std::memcpy(&challenge, response + 1, 4);
     challenge = ntohl(challenge);
+
     uint32_t signature = secret_num ^ challenge;
     uint32_t signature_net = htonl(signature);
 
-    // Step 5: send 5-byte signature
-    sig_msg[0] = response[0]; // group ID
+    sig_msg[0] = response[0];
     std::memcpy(sig_msg + 1, &signature_net, 4);
-    if (sendto(sock, sig_msg, 5, 0, (sockaddr*)&target, sender_len) < 0) {
-        die("sendto failed");
-    }
 
-    // Step 6: receive final secret port message
-    char secret_port[1024];
-    recv_bytes = recvfrom(sock, secret_port, sizeof(secret_port), 0,
-                          (sockaddr*)&target, &sender_len);
-    if (recv_bytes > 0) {
-        std::cout << "Received secret port message:\n"
-                  << std::string(secret_port, recv_bytes) << "\n\n";
-    } else {
-        perror("recvfrom failed or timed out");
-    }
+    if (sendto(sock, sig_msg, 5, 0, (sockaddr*)&target, slen) < 0) die("sendto failed");
+
+    char secret_port[MAX_BUFFER];
+    n = recvfrom(sock, secret_port, sizeof(secret_port), 0, (sockaddr*)&target, &slen);
+    if (n > 0) std::cout << "Received secret port message:\n" << std::string(secret_port, n) << "\n";
+    else perror("recvfrom timed out");
 }
-
 // Assumes:
 // - sock is your UDP socket (int) with SO_RCVTIMEO already set
 // - target is a sockaddr_in with sin_family and sin_addr already set
@@ -291,7 +300,7 @@ void send_knocks(int sock, sockaddr_in target,
                  const std::vector<int>& knock_sequence,
                  const char sig_msg[5], char* buffer,
                  const std::string& splitter,
-                 const std::string& phrase) // <- added
+                 const std::string& phrase)
 {
     const uint8_t* signature = reinterpret_cast<const uint8_t*>(sig_msg + 1);
 
@@ -303,7 +312,6 @@ void send_knocks(int sock, sockaddr_in target,
         memcpy(knock.data(), signature, 4);
         memcpy(knock.data() + 4, phrase.data(), phrase.size());
 
-        // Send knock
         if (sendto(sock, knock.data(), knock.size(), 0,
                    (struct sockaddr*)&target, sizeof(target)) < 0) {
             perror("sendto failed");
@@ -313,15 +321,13 @@ void send_knocks(int sock, sockaddr_in target,
         std::cout << "Sent knock " << (i + 1) << "/" << knock_sequence.size()
                   << " to port " << port << " (" << knock.size() << " bytes)\n";
 
-        // Wait for reply
         socklen_t slen = sizeof(target);
         int n = recvfrom(sock, buffer, 1024, 0, (struct sockaddr*)&target, &slen);
         if (n > 0) {
             std::string reply(buffer, n);
-            std::cout << splitter << "\n\nPORT " << port << " replied:\n" << reply << "\n";
+            std::cout << splitter << "PORT " << port << " replied:\n" << reply << "\n";
 
             if (reply.find("Congratulations") != std::string::npos) {
-                std::cout << "🎉 SUCCESS: Final knock accepted!\n";
                 break;
             }
         } else {
@@ -335,22 +341,19 @@ void send_knocks(int sock, sockaddr_in target,
 
 
 
+
 int main(int argc, char* argv[]) {
     if (argc != 7 && argc != 9) {
-        std::cout << "Usage: ./scanner <IP Address> <port1> <port2> <port3> <port4> <mode> [optional extra args]\n";
+        std::cout << "Usage: ./scanner <IP> <port1> <port2> <port3> <port4> <mode> [extra args]\n";
         std::cout << "Mode 0 = send 123456, Mode 1 = send custom/secret messages\n";
         return EXIT_FAILURE;
     }
-    std::string phrase; // for the secret phrase later
-    const char* ipaddr = argv[1];
-    int port1 = atoi(argv[2]);
-    int port2 = atoi(argv[3]);
-    int port3 = atoi(argv[4]);
-    int port4 = atoi(argv[5]);
-    int mode = atoi(argv[6]);
-    std::vector<int> ports = {port1, port2, port3, port4};
 
-    // Secret setup
+    const char* ipaddr = argv[1];
+    int mode = atoi(argv[6]);
+    std::vector<int> ports = {atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5])};
+    std::string phrase; // secret phrase from port 2
+
     uint32_t secret_num = 0x00816BF2;
     std::string users = "odinns24,thorvardur23,thora23";
     auto secret_msg = generateSecretMessage(secret_num, users);
@@ -358,101 +361,74 @@ int main(int argc, char* argv[]) {
     std::cout << "Secret message (hex): ";
     printHex(secret_msg);
 
-    // Socket setup
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) die("socket failed");
-
-    timeval tv{};
-    tv.tv_sec = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        die("setsockopt failed");
-    }
-
-    sockaddr_in target{};
-    target.sin_family = AF_INET;
-    if (inet_pton(AF_INET, ipaddr, &target.sin_addr) <= 0) {
-        die("inet_pton failed");
-    }
+    int sock = create_udp_socket();
+    sockaddr_in target = build_target(ipaddr);
 
     char buffer[1024];
-    std::string splitter =
-        "\n==========================================================================";
+    std::string splitter = "\n==============================================================\n";
 
+    // First 4 ports
     for (size_t i = 0; i < ports.size(); ++i) {
         target.sin_port = htons(ports[i]);
 
-        if (i == 0) {
-            handleSecretPort(sock, target, mode, secret_msg, secret_num);
-        } else if (i == 1) {
-            const char* signature = sig_msg + 1; // 4-byte signature
+        if (i == 0) handleSecretPort(sock, target, mode, secret_msg, secret_num);
+        else if (i == 1) {
+            const char* signature = sig_msg + 1;
             checksum(sock, target, mode, signature, 4);
 
-            // --- Receive the secret phrase from port 4011 ---
-            socklen_t len = sizeof(target);
-            int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &len);
-            
+            int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
             if (n > 0) {
                 std::string msg(buffer, n);
-                std::cout << splitter << "\n\nPORT " << ports[i] << " says:\n" << msg << "\n";
+                std::cout << splitter << "PORT " << ports[i] << " says:\n" << msg << "\n";
 
-                // Extract phrase dynamically
                 phrase = extract_secret_phrase(msg);
-
                 if (phrase.empty()) {
                     std::cerr << "Failed to extract secret phrase!\n";
                     return EXIT_FAILURE;
-                } else {
-                    std::cout << "Extracted secret phrase: " << phrase << "\n";
                 }
             }
         }
         else if (i == 2) {
-            uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88}; // your S.E.C.R.E.T7
-			handleEvilPort(sock, target, sig);
+            uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88};
+            handleEvilPort(sock, target, sig);
         }
 
-        socklen_t len = sizeof(target);
-        int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &len);
-        if (n > 0) {
-            std::cout << splitter << "\n\nPORT " << ports[i]
-                      << " says:\n\n" << std::string(buffer, n) << "\n";
-        }
+        int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
+        if (n > 0)
+            std::cout << splitter << "PORT " << ports[i] << " says:\n" << std::string(buffer, n) << "\n";
     }
+
+    // Optional last port (argc == 9)
     if (argc == 9) {
-    // Combine extra args as port list for the last port
-    char combined[64];
-    snprintf(combined, sizeof(combined), "%s,%s", argv[7], argv[8]);
-    target.sin_port = htons(ports[3]); // E.X.P.S.T.N
+        char combined[64];
+        snprintf(combined, sizeof(combined), "%s,%s", argv[7], argv[8]);
+        target.sin_port = htons(ports[3]);
 
-    getFinalPort(sock, target, mode, combined);
+        getFinalPort(sock, target, mode, combined);
 
-    socklen_t slen = sizeof(target);
-    int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&target, &slen);
-    if (n > 0) {
-        std::string reply(buffer, n);
-        std::cout << splitter << "\n\nPORT " << ports[3] << " says:\n" << reply << "\n";
+        int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
+        if (n > 0) {
+            std::string reply(buffer, n);
+            std::cout << splitter << "PORT " << ports[3] << " says:\n" << reply << "\n";
 
-        // Parse knock sequence
-        std::vector<int> knock_sequence;
-        std::stringstream ss(reply);
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            knock_sequence.push_back(std::stoi(token));
-        }
+            // Parse knock sequence
+            std::vector<int> knock_sequence;
+            std::stringstream ss(reply);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                knock_sequence.push_back(std::stoi(token));
+            }
 
-        // Send knocks in order and wait for response after each
-        if (!phrase.empty()) {
-            send_knocks(sock, target, knock_sequence, sig_msg, buffer, splitter, phrase);
-        } else {
-            std::cerr << "Cannot send knocks: secret phrase missing!\n";
-            return EXIT_FAILURE;
+            // Only send knocks if we have the secret phrase
+            if (!phrase.empty())
+                send_knocks(sock, target, knock_sequence, sig_msg, buffer, splitter, phrase);
+            else {
+                std::cerr << "Cannot send knocks: secret phrase missing!\n";
+                return EXIT_FAILURE;
+            }
         }
     }
-}
 
-
-
-    if (close(sock) < 0) die("close failed");
-
+    close(sock);
     return EXIT_SUCCESS;
 }
