@@ -9,6 +9,53 @@
 
 // Global for signature (kept since later ports depend on it)
 char sig_msg[5];
+#include <arpa/inet.h>
+#include <cstring>
+#include <iostream>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+struct pseudo_udp_packet {
+    iphdr ip;
+    udphdr udp;
+    char data[16]; // small payload
+};
+
+void send_fake_udp(int sock, sockaddr_in& server, uint16_t checksum, const char* src_ip) {
+    pseudo_udp_packet pkt{};
+    const char* payload = "secret";
+    size_t payload_len = strlen(payload);
+
+    // IPv4 header
+    pkt.ip.version = 4;
+    pkt.ip.ihl = 5;
+    pkt.ip.tot_len = htons(sizeof(iphdr) + sizeof(udphdr) + payload_len);
+    pkt.ip.ttl = 64;
+    pkt.ip.protocol = IPPROTO_UDP;
+    pkt.ip.saddr = inet_addr(src_ip);
+    pkt.ip.daddr = server.sin_addr.s_addr;
+
+    // UDP header
+    pkt.udp.source = htons(12345);
+    pkt.udp.dest = server.sin_port;
+    pkt.udp.len = htons(sizeof(udphdr) + payload_len);
+    pkt.udp.check = htons(checksum);
+
+    // Payload
+    memcpy(pkt.data, payload, payload_len);
+
+    // Send the "encapsulated packet" as the UDP *payload*
+    if (sendto(sock, &pkt, sizeof(iphdr) + sizeof(udphdr) + payload_len, 0,
+               (sockaddr*)&server, sizeof(server)) < 0) {
+        perror("sendto failed");
+    } else {
+        std::cout << "Sent encapsulated UDP packet with checksum 0x"
+                  << std::hex << checksum << std::dec
+                  << " and src=" << src_ip << "\n";
+    }
+}
 
 // Helper: print error and exit
 void die(const std::string& msg) {
@@ -39,30 +86,97 @@ std::vector<uint8_t> generateSecretMessage(uint32_t secret_num, const std::strin
 }
 
 // Port handlers
-void handlePortPingOrPassword(int sock, sockaddr_in& target, bool mode) {
+void getFinalPort(int sock, sockaddr_in& target, bool mode) {
     const char* msg = mode ? "ping1" : "123456";
     if (sendto(sock, msg, strlen(msg), 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
 }
 
-void handlePortWithMessage(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
+void checksum(int sock, sockaddr_in& target, bool mode, const char* msg, size_t msg_len) {
     const char* payload = mode ? msg : "123456";
     size_t len = mode ? msg_len : strlen(payload);
 
+    // send message
     if (sendto(sock, payload, len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
-}
-void handleEvilPort(int sock, sockaddr_in& target, const uint8_t sig[4]) {
-    // Just send the 4-byte signature payload
-    sendto(sock, sig, 4, 0, (sockaddr*)&target, sizeof(target));
 
-    // Receive reply immediately
+    // receive reply
+    char buf[2048];
+    socklen_t tlen = sizeof(target);
+    int n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&target, &tlen);
+    if (n < 0) {
+        perror("recvfrom failed");
+        return;
+    }
+
+    std::cout << "Server replied: " << std::string(buf, n) << "\n";
+
+    if (n >= 6) {
+        // Last 6 bytes
+        const uint8_t* last6 = reinterpret_cast<uint8_t*>(buf + n - 6);
+
+        uint16_t checksum_val;
+        memcpy(&checksum_val, last6, 2);
+        checksum_val = ntohs(checksum_val); // convert from network to host order
+
+        uint32_t ip_raw;
+        memcpy(&ip_raw, last6 + 2, 4);
+        in_addr ip_addr{};
+        ip_addr.s_addr = ip_raw; // already in network order
+
+        std::cout << "Extracted checksum: 0x" << std::hex << checksum_val << std::dec << "\n";
+        std::cout << "Extracted IP: " << inet_ntoa(ip_addr) << "\n";
+
+        // Send back the encapsulated UDP packet using extracted values
+        send_fake_udp(sock, target, checksum_val, inet_ntoa(ip_addr));
+    } else {
+        std::cout << "Message too short to contain secret.\n";
+    }
+}
+
+
+
+void handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
+    // 1. Get the local IP and port of the normal UDP socket
+    sockaddr_in local{};
+    socklen_t len = sizeof(local);
+    getsockname(udpSock, (sockaddr*)&local, &len);
+
+    // 2. Create a minimal header template
+    uint8_t pkt[32] = {0};            // IPv4 header + UDP header + 4-byte payload
+    pkt[0] = 0x45;                     // IPv4 version + IHL
+    uint16_t* flags = (uint16_t*)(pkt + 6);
+    *flags = htons(0x8000);            // Set Evil Bit
+    pkt[8] = 64;                        // TTL
+    pkt[9] = 17;                        // Protocol = UDP
+    memcpy(pkt + 12, &local.sin_addr, 4);   // Source IP
+    memcpy(pkt + 16, &target.sin_addr, 4);  // Destination IP
+
+    // UDP header
+    uint16_t sport = local.sin_port;   // Source port = bound UDP socket
+    uint16_t dport = target.sin_port;
+    uint16_t ulen = htons(8 + 4);     // UDP length = header + payload
+    memcpy(pkt + 20, &sport, 2);
+    memcpy(pkt + 22, &dport, 2);
+    memcpy(pkt + 24, &ulen, 2);
+
+    // 4-byte signature payload
+    memcpy(pkt + 28, sig, 4);
+
+    // 3. Send via raw socket
+    int rawSock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    int one = 1;
+    setsockopt(rawSock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    sendto(rawSock, pkt, sizeof(pkt), 0, (sockaddr*)&target, sizeof(target));
+    close(rawSock);
+
+    // 4. Receive reply on normal UDP socket
     char buf[1024];
-    socklen_t len = sizeof(target);
-    int n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&target, &len);
-    if(n > 0) {
+    socklen_t slen = sizeof(target);
+    int n = recvfrom(udpSock, buf, sizeof(buf), 0, (sockaddr*)&target, &slen);
+    if (n > 0) {
         std::cout << "Evil port replied: " << std::string(buf, n) << "\n";
     } else {
         perror("recvfrom failed or timed out");
@@ -166,12 +280,12 @@ int main(int argc, char* argv[]) {
             handleSecretPort(sock, target, mode, secret_msg, secret_num);
         } else if (i == 1) {
             const char* signature = sig_msg + 1; // 4-byte signature
-            handlePortWithMessage(sock, target, mode, signature, 4);
+            checksum(sock, target, mode, signature, 4);
         }else if (i == 2) {
             uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88}; // your S.E.C.R.E.T7
 			handleEvilPort(sock, target, sig);
         } else {
-            handlePortPingOrPassword(sock, target, mode);
+            getFinalPort(sock, target, mode);
         }
 
         socklen_t len = sizeof(target);
