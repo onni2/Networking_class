@@ -84,11 +84,11 @@ int main(int argc, char* argv[]) {
 
 	// Then, append ready-to-run command
 	outfile << "\nNow you can run the code with:\n";
-	outfile << "./puzzlesolver " << ipaddr << " "
+	outfile << "sudo ./puzzlesolver " << ipaddr << " "
 			<< ordered_ports[1] << " "
 			<< ordered_ports[2] << " "
 			<< ordered_ports[3] << " "
-			<< ordered_ports[4] << " 1\n";
+			<< ordered_ports[4] << "\n";
 
 	outfile.close();
 	std::cout << "Saved 4 open ports and ready-to-run command in open_ports.txt\n";
