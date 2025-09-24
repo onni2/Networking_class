@@ -24,7 +24,7 @@ int main(int argc, char* argv[]) {
     }
 
     timeval tv{};
-    tv.tv_sec = 1;  // 1 second timeout
+    tv.tv_sec = 1;  // for a 1 second tie outs
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     sockaddr_in target{};
@@ -76,13 +76,11 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	// First, write ports per line
 	for (int i = 1; i <= 4; i++) {
 		if (ordered_ports.find(i) != ordered_ports.end())
 			outfile << ordered_ports[i] << "\n";
 	}
 
-	// Then, append ready-to-run command
 	outfile << "\nNow you can run the code with:\n";
 	outfile << "sudo ./puzzlesolver " << ipaddr << " "
 			<< ordered_ports[1] << " "

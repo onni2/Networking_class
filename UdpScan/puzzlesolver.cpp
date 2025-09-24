@@ -11,18 +11,18 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <regex>
+#include <netinet/ip_icmp.h>
 
-// Global for signature (kept since later ports depend on it)
-char sig_msg[5]; // 4-byte signature + group ID
+char sig_msg[5]; // signature storage
 constexpr size_t MAX_BUFFER = 1024;
 constexpr int TIMEOUT_SEC = 1;
 
- // Utility functions
 void die(const std::string &msg) {
     perror(msg.c_str());
     exit(EXIT_FAILURE);
 }
 
+// find text between first and last quotes
 std::string extract_secret_phrase(const std::string& msg) {
     size_t start = msg.find('"');
     size_t end   = msg.rfind('"');
@@ -31,9 +31,8 @@ std::string extract_secret_phrase(const std::string& msg) {
     return "";
 }
 
-// NEW: Extract port number from server response
+// try various port patterns until one works
 int extract_port_number(const std::string& msg) {
-    // Look for patterns like "port: 4079" or "secret port: 4058"
     std::regex port_regex(R"(port:\s*(\d+))");
     std::smatch match;
     
@@ -41,25 +40,22 @@ int extract_port_number(const std::string& msg) {
         return std::stoi(match[1].str());
     }
     
-    // Alternative pattern: "port 4079" or similar
     std::regex alt_regex(R"(port\s+(\d+))");
     if (std::regex_search(msg, match, alt_regex)) {
         return std::stoi(match[1].str());
     }
     
-    // Pattern for "secret port: \n4058" (with possible newline)
     std::regex secret_regex(R"(secret port[:\s]*\s*(\d+))");
     if (std::regex_search(msg, match, secret_regex)) {
         return std::stoi(match[1].str());
     }
     
-    // More general pattern: any sequence of digits after "port"
     std::regex general_regex(R"(port[^0-9]*(\d+))");
     if (std::regex_search(msg, match, general_regex)) {
         return std::stoi(match[1].str());
     }
     
-    return -1; // Not found
+    return -1;
 }
 
 void printHex(const std::vector<uint8_t>& data) {
@@ -67,6 +63,7 @@ void printHex(const std::vector<uint8_t>& data) {
     printf("\n");
 }
 
+// build message: 'S' + 32-bit number + user list
 std::vector<uint8_t> generateSecretMessage(uint32_t secret_num, const std::string& users) {
     std::vector<uint8_t> msg;
     msg.reserve(1 + 4 + users.size());
@@ -77,7 +74,7 @@ std::vector<uint8_t> generateSecretMessage(uint32_t secret_num, const std::strin
     return msg;
 }
 
-// Networking helpers
+// socket with timeout
 int create_udp_socket() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) die("socket failed");
@@ -107,10 +104,10 @@ int recv_from_socket(int sock, sockaddr_in& target, char* buffer, size_t bufsize
 struct pseudo_udp_packet {
     iphdr ip;
     udphdr udp;
-    char data[32]; // small payload
+    char data[32];
 };
 
-// Compute UDP checksum over pseudo-header + UDP header + data
+// standard UDP checksum with pseudo header
 uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
     struct pseudo_header {
         uint32_t src;
@@ -124,7 +121,7 @@ uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
     ph.dst = ip.daddr;
     ph.zero = 0;
     ph.protocol = IPPROTO_UDP;
-    ph.udp_len = udp.len; // network byte order
+    ph.udp_len = udp.len; 
 
     size_t total_len = sizeof(ph) + ntohs(udp.len);
     std::vector<uint8_t> buf(total_len);
@@ -138,22 +135,23 @@ uint16_t udp_checksum(iphdr& ip, udphdr& udp, const char* data, size_t len) {
         sum += (buf[i] << 8) | buf[i + 1];
         if (sum > 0xffff) sum = (sum & 0xffff) + 1;
     }
-    if (total_len & 1) { // odd length
+    if (total_len & 1) { 
         sum += buf[total_len - 1] << 8;
         if (sum > 0xffff) sum = (sum & 0xffff) + 1;
     }
     return htons(~sum & 0xffff);
 }
 
+// craft UDP packet with specific checksum
 void send_fake_udp(int sock, sockaddr_in& server, uint16_t target_checksum, const char* src_ip) {
     pseudo_udp_packet pkt{};
     const char* payload = "secret";
     size_t payload_len = strlen(payload);
 
-    // IPv4 header
+    // basic IP header
     pkt.ip.version = 4;
     pkt.ip.ihl = 5;
-    pkt.ip.tot_len = htons(sizeof(iphdr) + sizeof(udphdr) + payload_len + 2); // +2 for tweak bytes
+    pkt.ip.tot_len = htons(sizeof(iphdr) + sizeof(udphdr) + payload_len + 2);
     pkt.ip.ttl = 64;
     pkt.ip.protocol = IPPROTO_UDP;
     pkt.ip.saddr = inet_addr(src_ip);
@@ -162,24 +160,21 @@ void send_fake_udp(int sock, sockaddr_in& server, uint16_t target_checksum, cons
     // UDP header
     pkt.udp.source = htons(12345);
     pkt.udp.dest = server.sin_port;
-    pkt.udp.len = htons(sizeof(udphdr) + payload_len + 2); // +2 for tweak bytes
+    pkt.udp.len = htons(sizeof(udphdr) + payload_len + 2);
 
-    // Copy payload
     memcpy(pkt.data, payload, payload_len);
 
-    // Compute current checksum
+    // calculate current checksum
     uint16_t csum = ntohs(udp_checksum(pkt.ip, pkt.udp, pkt.data, payload_len));
 
-    // Compute tweak bytes to force desired checksum
-    uint16_t diff = csum - target_checksum; // 16-bit difference
+    // add bytes to force desired checksum
+    uint16_t diff = csum - target_checksum;
     pkt.data[payload_len]     = diff >> 8;
     pkt.data[payload_len + 1] = diff & 0xff;
     payload_len += 2;
 
-    // Recompute UDP checksum over modified payload
     pkt.udp.check = udp_checksum(pkt.ip, pkt.udp, pkt.data, payload_len);
 
-    // Send encapsulated packet as UDP payload
     if (sendto(sock, &pkt, sizeof(iphdr) + sizeof(udphdr) + payload_len, 0,
                (sockaddr*)&server, sizeof(server)) < 0) {
         perror("sendto failed");
@@ -190,20 +185,18 @@ void send_fake_udp(int sock, sockaddr_in& server, uint16_t target_checksum, cons
     }
 }
 
-// Port handlers
 void getFinalPort(int sock, sockaddr_in& target, const char* combined) {
     if (sendto(sock, combined, strlen(combined), 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
 }
 
+// send signature, get checksum and IP from response
 void checksum(int sock, sockaddr_in& target, const char* msg, size_t msg_len) {
-    // send message
     if (sendto(sock, msg, msg_len, 0, (sockaddr*)&target, sizeof(target)) < 0) {
         die("sendto failed");
     }
 
-    // receive reply
     char buf[2048];
     socklen_t tlen = sizeof(target);
     int n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&target, &tlen);
@@ -215,63 +208,59 @@ void checksum(int sock, sockaddr_in& target, const char* msg, size_t msg_len) {
     std::cout << "Server replied: " << std::string(buf, n) << "\n";
 
     if (n >= 6) {
-        // Last 6 bytes
+        // extract last 6 bytes: 2-byte checksum + 4-byte IP
         const uint8_t* last6 = reinterpret_cast<uint8_t*>(buf + n - 6);
 
         uint16_t checksum_val;
         memcpy(&checksum_val, last6, 2);
-        checksum_val = ntohs(checksum_val); // convert from network to host order
+        checksum_val = ntohs(checksum_val); 
 
         uint32_t ip_raw;
         memcpy(&ip_raw, last6 + 2, 4);
         in_addr ip_addr{};
-        ip_addr.s_addr = ip_raw; // already in network order
+        ip_addr.s_addr = ip_raw; 
 
         std::cout << "Extracted checksum: 0x" << std::hex << checksum_val << std::dec << "\n";
         std::cout << "Extracted IP: " << inet_ntoa(ip_addr) << "\n";
 
-        // Send back the encapsulated UDP packet using extracted values
         send_fake_udp(sock, target, checksum_val, inet_ntoa(ip_addr));
     } else {
         std::cout << "Message too short to contain secret.\n";
     }
 }
 
+// send raw packet with evil bit set
 int handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
-    // 1. Get the local IP and port of the normal UDP socket
     sockaddr_in local{};
     socklen_t len = sizeof(local);
     getsockname(udpSock, (sockaddr*)&local, &len);
 
-    // 2. Create a minimal header template
-    uint8_t pkt[32] = {0};            // IPv4 header + UDP header + 4-byte payload
-    pkt[0] = 0x45;                     // IPv4 version + IHL
+    // build minimal IP+UDP packet
+    uint8_t pkt[32] = {0};
+    pkt[0] = 0x45;                     // IPv4
     uint16_t* flags = (uint16_t*)(pkt + 6);
-    *flags = htons(0x8000);            // Set Evil Bit
-    pkt[8] = 64;                        // TTL
-    pkt[9] = 17;                        // Protocol = UDP
-    memcpy(pkt + 12, &local.sin_addr, 4);   // Source IP
-    memcpy(pkt + 16, &target.sin_addr, 4);  // Destination IP
+    *flags = htons(0x8000);            // evil bit
+    pkt[8] = 64;                       // TTL
+    pkt[9] = 17;                       // UDP
+    memcpy(pkt + 12, &local.sin_addr, 4);
+    memcpy(pkt + 16, &target.sin_addr, 4);
 
-    // UDP header
-    uint16_t sport = local.sin_port;   // Source port = bound UDP socket
+    uint16_t sport = local.sin_port;
     uint16_t dport = target.sin_port;
-    uint16_t ulen = htons(8 + 4);     // UDP length = header + payload
+    uint16_t ulen = htons(8 + 4);
     memcpy(pkt + 20, &sport, 2);
     memcpy(pkt + 22, &dport, 2);
     memcpy(pkt + 24, &ulen, 2);
-
-    // 4-byte signature payload
     memcpy(pkt + 28, sig, 4);
 
-    // 3. Send via raw socket
+    // send via raw socket
     int rawSock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
     int one = 1;
     setsockopt(rawSock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     sendto(rawSock, pkt, sizeof(pkt), 0, (sockaddr*)&target, sizeof(target));
     close(rawSock);
 
-    // 4. Receive reply on normal UDP socket
+    // get reply on normal socket
     char buf[1024];
     socklen_t slen = sizeof(target);
     int n = recvfrom(udpSock, buf, sizeof(buf), 0, (sockaddr*)&target, &slen);
@@ -285,6 +274,7 @@ int handleEvilPort(int udpSock, sockaddr_in& target, const uint8_t sig[4]) {
     }
 }
 
+// challenge-response exchange
 int handleSecretPort(int sock, sockaddr_in& target, const std::vector<uint8_t>& secret_msg, uint32_t secret_num) {
     if (sendto(sock, secret_msg.data(), secret_msg.size(), 0, (sockaddr*)&target, sizeof(target)) < 0) die("sendto failed");
 
@@ -297,6 +287,7 @@ int handleSecretPort(int sock, sockaddr_in& target, const std::vector<uint8_t>& 
     std::memcpy(&challenge, response + 1, 4);
     challenge = ntohl(challenge);
 
+    // XOR challenge with secret
     uint32_t signature = secret_num ^ challenge;
     uint32_t signature_net = htonl(signature);
 
@@ -317,6 +308,69 @@ int handleSecretPort(int sock, sockaddr_in& target, const std::vector<uint8_t>& 
     }
 }
 
+// standard ICMP checksum
+unsigned short icmp_checksum(void *b, int len) {
+    unsigned short *buf = (unsigned short*)b;
+    unsigned int sum = 0;
+    unsigned short result;
+
+    for (sum = 0; len > 1; len -= 2) {
+        sum += *buf++;
+    }
+
+    if (len == 1) {
+        sum += *(unsigned char*)buf << 8;
+    }
+
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    result = ~sum;
+    return result;
+}
+
+// send ICMP ping with group identifier
+void send_icmp_bonus(const std::string& target_ip) {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        perror("ICMP socket failed (need root privileges)");
+        return;
+    }
+
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    inet_pton(AF_INET, target_ip.c_str(), &target.sin_addr);
+
+    const char* group_data = "$group_7$";
+    size_t data_len = strlen(group_data);
+
+    std::vector<char> packet(sizeof(struct icmphdr) + data_len);
+    struct icmphdr* icmp = reinterpret_cast<struct icmphdr*>(packet.data());
+
+    icmp->type = ICMP_ECHO;
+    icmp->code = 0;
+    icmp->un.echo.id = static_cast<uint16_t>(getpid() & 0xFFFF);
+    icmp->un.echo.sequence = 1;
+    icmp->checksum = 0;
+
+    memcpy(packet.data() + sizeof(struct icmphdr), group_data, data_len);
+
+    icmp->checksum = icmp_checksum(packet.data(), packet.size());
+
+    if (sendto(sock, packet.data(), packet.size(), 0,
+               (struct sockaddr*)&target, sizeof(target)) < 0) {
+        perror("ICMP sendto failed");
+        close(sock);
+        return;
+    } else {
+        std::cout << "*** Sent ICMP packet with '" << group_data
+                  << "' to " << target_ip << " ***\n";
+    }
+}
+
+// knock on ports in sequence
 void send_knocks(int sock, sockaddr_in target,
                  const std::vector<int>& knock_sequence,
                  const char sig_msg[5], char* buffer,
@@ -324,11 +378,13 @@ void send_knocks(int sock, sockaddr_in target,
                  const std::string& phrase)
 {
     const uint8_t* signature = reinterpret_cast<const uint8_t*>(sig_msg + 1);
+    std::string target_ip = inet_ntoa(target.sin_addr);
 
     for (size_t i = 0; i < knock_sequence.size(); ++i) {
         int port = knock_sequence[i];
         target.sin_port = htons(port);
 
+        // signature + phrase
         std::vector<uint8_t> knock(4 + phrase.size());
         memcpy(knock.data(), signature, 4);
         memcpy(knock.data() + 4, phrase.data(), phrase.size());
@@ -355,6 +411,8 @@ void send_knocks(int sock, sockaddr_in target,
             perror("recvfrom timed out or failed");
         }
     }
+    
+    send_icmp_bonus(target_ip);
 }
 
 int main(int argc, char* argv[]) {
@@ -367,10 +425,9 @@ int main(int argc, char* argv[]) {
     const char* ipaddr = argv[1];
     std::vector<int> ports = {atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5])};
     
-    // Variables to store extracted information
-    std::string phrase; // secret phrase from port 2
-    int secret_port1 = -1; // port from secret port response  
-    int secret_port2 = -1; // port from evil port response
+    std::string phrase;
+    int secret_port1 = -1;
+    int secret_port2 = -1;
 
     uint32_t secret_num = 0x00816BF2;
     std::string users = "odinns24,thorvardur23,thora23";
@@ -385,19 +442,17 @@ int main(int argc, char* argv[]) {
     char buffer[1024];
     std::string splitter = "\n==============================================================\n";
 
-    // Process the first 4 ports and extract information
+    // hit each port in order
     for (size_t i = 0; i < ports.size(); ++i) {
         target.sin_port = htons(ports[i]);
 
         if (i == 0) {
-            // Secret port
             secret_port1 = handleSecretPort(sock, target, secret_msg, secret_num);
             if (secret_port1 != -1) {
                 std::cout << "*** EXTRACTED SECRET PORT 1: " << secret_port1 << " ***\n";
             }
         }
         else if (i == 1) {
-            // Checksum port  
             const char* signature = sig_msg + 1;
             checksum(sock, target, signature, 4);
 
@@ -406,7 +461,6 @@ int main(int argc, char* argv[]) {
                 std::string msg(buffer, n);
                 std::cout << splitter << "PORT " << ports[i] << " says:\n" << msg << "\n";
 
-                // Extract secret phrase
                 phrase = extract_secret_phrase(msg);
                 if (!phrase.empty()) {
                     std::cout << "*** EXTRACTED SECRET PHRASE: \"" << phrase << "\" ***\n";
@@ -416,7 +470,6 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (i == 2) {
-            // Evil port
             uint8_t sig[4] = {0xBA, 0x5C, 0xEB, 0x88};
             secret_port2 = handleEvilPort(sock, target, sig);
             if (secret_port2 != -1) {
@@ -424,7 +477,6 @@ int main(int argc, char* argv[]) {
             }
         }
         else {
-            // Regular port
             int n = recv_from_socket(sock, target, buffer, sizeof(buffer));
             if (n > 0) {
                 std::cout << splitter << "PORT " << ports[i] << " says:\n" << std::string(buffer, n) << "\n";
@@ -432,17 +484,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Now automatically proceed with the final challenge if we have everything
+    // proceed if we got everything
     if (secret_port1 != -1 && secret_port2 != -1 && !phrase.empty()) {
         std::cout << "\n*** PROCEEDING WITH FINAL CHALLENGE ***\n";
         std::cout << "Using secret ports: " << secret_port1 << ", " << secret_port2 << "\n";
         std::cout << "Using secret phrase: \"" << phrase << "\"\n\n";
         
-        // Create the combined message for the final port
         char combined[64];
         snprintf(combined, sizeof(combined), "%d,%d", secret_port1, secret_port2);
         
-        // Send to the last port to get knock sequence
         target.sin_port = htons(ports[3]);
         getFinalPort(sock, target, combined);
 
@@ -451,7 +501,7 @@ int main(int argc, char* argv[]) {
             std::string reply(buffer, n);
             std::cout << splitter << "PORT " << ports[3] << " says:\n" << reply << "\n";
 
-            // Parse knock sequence
+            // parse comma-separated knock sequence
             std::vector<int> knock_sequence;
             std::stringstream ss(reply);
             std::string token;
@@ -459,7 +509,6 @@ int main(int argc, char* argv[]) {
                 try {
                     knock_sequence.push_back(std::stoi(token));
                 } catch (const std::exception& e) {
-                    // Skip invalid tokens
                     continue;
                 }
             }

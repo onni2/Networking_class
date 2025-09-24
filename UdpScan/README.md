@@ -160,8 +160,6 @@ cat open_ports.txt
 # 3. Run the challenge solver (copy command from file)
 ./puzzlesolver 130.208.246.98 8001 4011 8003 8004
 
-# 4. (Optional) Send ICMP for bonus points
-ping -c 1 -p $(echo -n '$group_7' | xxd -p) 130.208.246.98
 ```
 
 ## Network Analysis
@@ -181,42 +179,3 @@ Raw socket operations require elevated privileges:
 sudo ./puzzlesolver 130.208.246.98 8001 4011 8003 8004
 ```
 
-### Port Discovery Issues
-
-If scanner doesn't find 4 ports:
-- Expand search range: `./scanner 130.208.246.98 3000 5000`
-- Check network connectivity: `ping 130.208.246.98`
-- Verify target server is running
-
-### Challenge Solver Issues
-
-If automatic extraction fails:
-- Check server response formats in output
-- Verify all 4 challenge ports are correct
-- Ensure proper network permissions for raw sockets
-
-## Security Notes
-
-- This tool is for educational purposes
-- Use only on networks you own or have permission to test
-- Raw socket operations require appropriate privileges
-- Be mindful of network policies and firewalls
-
-## Group Configuration
-
-Current configuration is set for Group 7:
-- Group identifier: `$group_7`
-- Secret number: `0x00816BF2`
-- Users: `odinns24,thorvardur23,thora23`
-- Evil signature: `{0xBA, 0x5C, 0xEB, 0x88}`
-
-## License
-
-Educational project - use responsibly.
-
-## Group Information
-
-- Group 7 implementation
-- Network Programming Course
-- UDP/ICMP Protocol Exploration
-- Advanced Raw Socket Programming
