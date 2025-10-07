@@ -1,0 +1,45 @@
+[2025-10-06 13:53:37] ========================================
+[2025-10-06 13:53:37] Client starting: A5_1
+[2025-10-06 13:53:37] ========================================
+[2025-10-06 13:53:37] Client for group: A5_1
+[2025-10-06 13:53:37] Server: 127.0.0.1:4044
+[2025-10-06 13:54:01] Sent: SENDMSG to A5_2: "Hello from my client!"
+[2025-10-06 13:54:01] Received: OK,Message queued for A5_2
+[2025-10-06 13:54:19] Sent: GETMSG
+[2025-10-06 13:54:19] Received: SENDMSG,A5_1,TestServer,Welcome to the botnet!
+[2025-10-06 13:54:24] Sent: GETMSG
+[2025-10-06 13:54:24] Received: SENDMSG,A5_1,TestServer,This is a test message
+[2025-10-06 13:54:37] Sent: LISTSERVERS
+[2025-10-06 13:54:37] Received: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 13:55:09] Client exiting
+[2025-10-06 13:57:37] ========================================
+[2025-10-06 13:57:37] Client starting: A5_1
+[2025-10-06 13:57:37] ========================================
+[2025-10-06 13:57:37] Client for group: A5_1
+[2025-10-06 13:57:37] Server: 127.0.0.1:4044
+[2025-10-06 13:57:42] Sent: LISTSERVERS
+[2025-10-06 13:57:42] Received: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 13:57:51] Sent: SENDMSG to A5_2: "Test message"
+[2025-10-06 13:57:51] Received: OK,Message queued for A5_2
+[2025-10-06 13:57:54] Sent: GETMSG
+[2025-10-06 13:57:54] Received: SENDMSG,A5_1,TestServer,Welcome to the botnet!
+[2025-10-06 13:57:59] Client exiting
+[2025-10-06 14:02:28] ========================================
+[2025-10-06 14:02:28] Client starting: A5_1
+[2025-10-06 14:02:28] ========================================
+[2025-10-06 14:02:28] Client for group: A5_1
+[2025-10-06 14:02:28] Server: 127.0.0.1:4044
+[2025-10-06 14:02:37] Sent: LISTSERVERS
+[2025-10-06 14:02:37] Received: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 14:03:27] ========================================
+[2025-10-06 14:03:27] Client starting: A5_1
+[2025-10-06 14:03:27] ========================================
+[2025-10-06 14:03:27] Client for group: A5_1
+[2025-10-06 14:03:27] Server: 127.0.0.1:4044
+[2025-10-06 14:03:32] Sent: LISTSERVERS
+[2025-10-06 14:03:32] Received: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 14:03:37] Sent: SENDMSG to A5_2: "Test message"
+[2025-10-06 14:03:37] Received: OK,Message queued for A5_2
+[2025-10-06 14:03:41] Sent: GETMSG
+[2025-10-06 14:03:41] Received: SENDMSG,A5_1,TestServer,This is a test message
+[2025-10-06 14:03:44] Client exiting

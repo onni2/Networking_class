@@ -1,0 +1,60 @@
+[2025-10-06 13:53:03] ========================================
+[2025-10-06 13:53:03] Server starting (STUB for Early Bot): A5_1
+[2025-10-06 13:53:03] ========================================
+[2025-10-06 13:53:03] Server listening on port 4044
+[2025-10-06 13:53:03] Waiting for client connections...
+[2025-10-06 13:54:01] Accepted connection from 127.0.0.1:34774
+[2025-10-06 13:54:01] Received: SENDMSG,A5_2,A5_1,Hello from my client!
+[2025-10-06 13:54:01] Stored message for A5_2: A5_1,Hello from my client!
+[2025-10-06 13:54:01] Sent: OK,Message queued for A5_2
+[2025-10-06 13:54:01] Closed connection from 127.0.0.1:34774
+[2025-10-06 13:54:19] Accepted connection from 127.0.0.1:40558
+[2025-10-06 13:54:19] Received: GETMSG
+[2025-10-06 13:54:19] Delivered message to client: Welcome to the botnet!
+[2025-10-06 13:54:19] Closed connection from 127.0.0.1:40558
+[2025-10-06 13:54:24] Accepted connection from 127.0.0.1:34922
+[2025-10-06 13:54:24] Received: GETMSG
+[2025-10-06 13:54:24] Delivered message to client: This is a test message
+[2025-10-06 13:54:24] Closed connection from 127.0.0.1:34922
+[2025-10-06 13:54:37] Accepted connection from 127.0.0.1:45546
+[2025-10-06 13:54:37] Received: LISTSERVERS
+[2025-10-06 13:54:37] Sent server list: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 13:54:37] Closed connection from 127.0.0.1:45546
+[2025-10-06 13:57:25] ========================================
+[2025-10-06 13:57:25] Server starting (STUB for Early Bot): A5_1
+[2025-10-06 13:57:25] ========================================
+[2025-10-06 13:57:25] Server listening on port 4044
+[2025-10-06 13:57:25] Waiting for client connections...
+[2025-10-06 13:57:42] Accepted connection from 127.0.0.1:53296
+[2025-10-06 13:57:42] Received: LISTSERVERS
+[2025-10-06 13:57:42] Sent server list: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 13:57:42] Closed connection from 127.0.0.1:53296
+[2025-10-06 13:57:51] Accepted connection from 127.0.0.1:59422
+[2025-10-06 13:57:51] Received: SENDMSG,A5_2,A5_1,Test message
+[2025-10-06 13:57:51] Stored message for A5_2: A5_1,Test message
+[2025-10-06 13:57:51] Sent: OK,Message queued for A5_2
+[2025-10-06 13:57:51] Closed connection from 127.0.0.1:59422
+[2025-10-06 13:57:54] Accepted connection from 127.0.0.1:59424
+[2025-10-06 13:57:54] Received: GETMSG
+[2025-10-06 13:57:54] Delivered message to client: Welcome to the botnet!
+[2025-10-06 13:57:54] Closed connection from 127.0.0.1:59424
+[2025-10-06 14:02:37] Accepted connection from 127.0.0.1:45146
+[2025-10-06 14:02:37] Received: LISTSERVERS
+[2025-10-06 14:02:37] Sent server list: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 14:02:37] Closed connection from 127.0.0.1:45146
+[2025-10-06 14:03:00] Accepted connection from 127.0.0.1:40798
+[2025-10-06 14:03:07] Failed to receive command or connection closed
+[2025-10-06 14:03:07] Closed connection from 127.0.0.1:40798
+[2025-10-06 14:03:32] Accepted connection from 127.0.0.1:42292
+[2025-10-06 14:03:32] Received: LISTSERVERS
+[2025-10-06 14:03:32] Sent server list: SERVERS,A5_1,127.0.0.1,4044
+[2025-10-06 14:03:32] Closed connection from 127.0.0.1:42292
+[2025-10-06 14:03:37] Accepted connection from 127.0.0.1:42306
+[2025-10-06 14:03:37] Received: SENDMSG,A5_2,A5_1,Test message
+[2025-10-06 14:03:37] Stored message for A5_2: A5_1,Test message
+[2025-10-06 14:03:37] Sent: OK,Message queued for A5_2
+[2025-10-06 14:03:37] Closed connection from 127.0.0.1:42306
+[2025-10-06 14:03:41] Accepted connection from 127.0.0.1:43180
+[2025-10-06 14:03:41] Received: GETMSG
+[2025-10-06 14:03:41] Delivered message to client: This is a test message
+[2025-10-06 14:03:41] Closed connection from 127.0.0.1:43180
