@@ -1,6 +1,5 @@
 {
     "files.associations": {
-        "fstream": "cpp",
         "any": "cpp",
         "array": "cpp",
         "atomic": "cpp",
@@ -51,6 +50,7 @@
         "type_traits": "cpp",
         "utility": "cpp",
         "format": "cpp",
+        "fstream": "cpp",
         "future": "cpp",
         "initializer_list": "cpp",
         "iomanip": "cpp",

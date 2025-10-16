@@ -66,17 +66,43 @@ void logMessage(const std::string &message)
 // Get local IP address
 std::string getLocalIPAddress()
 {
-    char hostname[256];
-    gethostname(hostname, sizeof(hostname));
-
-    struct hostent *host_entry = gethostbyname(hostname);
-    if (host_entry == NULL)
+    // Try to get real external IP by connecting to external server
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
     {
         return "127.0.0.1";
     }
 
-    char *ip = inet_ntoa(*((struct in_addr *)host_entry->h_addr_list[0]));
-    return std::string(ip);
+    // Connect to external server (doesn't actually send data)
+    // This determines which network interface would be used
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr("8.8.8.8"); // Google DNS
+    serv_addr.sin_port = htons(53);
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    {
+        close(sock);
+        return "127.0.0.1";
+    }
+
+    // Get local address from the socket
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+    if (getsockname(sock, (struct sockaddr *)&local_addr, &addr_len) < 0)
+    {
+        close(sock);
+        return "127.0.0.1";
+    }
+
+    close(sock);
+
+    // Convert to string
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+
+    return std::string(ip_str);
 }
 
 int open_socket(int portno)
@@ -377,22 +403,95 @@ void triggerScan()
 }
 
 // Health monitor thread - checks connections periodically
+// Enhanced healthMonitorThread with proactive commands
+
 void *healthMonitorThread(void *arg)
 {
+    time_t lastKeepalive = time(nullptr);
+    time_t lastGetmsgs = time(nullptr);      
+    time_t lastStatusReq = time(nullptr);    
+    
     while (true)
     {
         sleep(30); // Check every 30 seconds
 
+        time_t now = time(nullptr);
+        
+        // ===== Send KEEPALIVE every 60 seconds =====
+        if (now - lastKeepalive >= 60)
+        {
+            pthread_mutex_lock(&serverMutex);
+            
+            for (const auto &pair : connectedServers)
+            {
+                if (!pair.second.groupId.empty() && pair.second.isOutgoing)
+                {
+                    int msgCount = messageQueue[pair.second.groupId].size();
+                    std::string keepalive = buildKEEPALIVE(msgCount);
+                    
+                    if (sendCommand(pair.first, keepalive))
+                    {
+                        logMessage("Sent keepalive to " + pair.second.groupId + 
+                                  " (" + std::to_string(msgCount) + " msgs)");
+                    }
+                }
+            }
+            
+            pthread_mutex_unlock(&serverMutex);
+            lastKeepalive = now;
+        }
+        
+        if (now - lastGetmsgs >= 90)
+        {
+            pthread_mutex_lock(&serverMutex);
+            
+            for (const auto &pair : connectedServers)
+            {
+                if (!pair.second.groupId.empty())
+                {
+                    std::string getmsgs = buildGETMSGS(MY_GROUP_ID);
+                    
+                    if (sendCommand(pair.first, getmsgs))
+                    {
+                        logMessage("Sent GETMSGS to " + pair.second.groupId);
+                    }
+                }
+            }
+            
+            pthread_mutex_unlock(&serverMutex);
+            lastGetmsgs = now;
+        }
+        
+        if (now - lastStatusReq >= 180)
+        {
+            pthread_mutex_lock(&serverMutex);
+            
+            for (const auto &pair : connectedServers)
+            {
+                if (!pair.second.groupId.empty())
+                {
+                    std::string statusreq = buildSTATUSREQ();
+                    
+                    if (sendCommand(pair.first, statusreq))
+                    {
+                        logMessage("Sent STATUSREQ to " + pair.second.groupId);
+                    }
+                }
+            }
+            
+            pthread_mutex_unlock(&serverMutex);
+            lastStatusReq = now;
+        }
+
         pthread_mutex_lock(&serverMutex);
 
         // Clean up dead connections
-        time_t now = time(nullptr);
         std::vector<int> toRemove;
 
         for (auto &pair : connectedServers)
         {
             if (now - pair.second.lastSeen > 180)
-            { // 3 minutes timeout
+            {
                 logMessage("Connection timeout: " + pair.second.groupId);
                 toRemove.push_back(pair.first);
             }
@@ -410,7 +509,6 @@ void *healthMonitorThread(void *arg)
 
         logMessage("Health check: " + std::to_string(connections) + " active connections");
 
-        // Trigger scan if below minimum
         if (connections < 3)
         {
             logMessage("Below minimum connections (" + std::to_string(connections) +
@@ -598,13 +696,51 @@ void handleClientCommand(int clientSocket, const std::string &command)
                 message += ",";
         }
 
-        // Store the message
-        messageQueue[toGroup].push(message);
+        logMessage("Client wants to send message to " + toGroup + ": " + message);
 
-        logMessage("Stored message for " + toGroup + ": " + message);
+        // ✅ TRY TO FORWARD IMMEDIATELY
+        bool forwarded = false;
+        
+        pthread_mutex_lock(&serverMutex);
+        
+        // Check if we're connected to destination
+        for (const auto &pair : connectedServers)
+        {
+            if (pair.second.groupId == toGroup)
+            {
+                pthread_mutex_unlock(&serverMutex);
+                
+                // Build proper SENDMSG command with FROM field
+                std::string forwardCmd = buildSENDMSG(toGroup, MY_GROUP_ID, message);
+                
+                if (sendCommand(pair.first, forwardCmd))
+                {
+                    logMessage("📬 Forwarded message to " + toGroup + " immediately");
+                    forwarded = true;
+                }
+                else
+                {
+                    logMessage("❌ Failed to forward to " + toGroup);
+                }
+                
+                pthread_mutex_lock(&serverMutex);
+                break;
+            }
+        }
+        
+        pthread_mutex_unlock(&serverMutex);
+        
+        // If not forwarded, store for later
+        if (!forwarded)
+        {
+            messageQueue[toGroup].push(message);
+            logMessage("📦 Stored message for " + toGroup + " (not connected)");
+        }
 
-        // Send acknowledgment
-        std::string response = "OK,Message queued for " + toGroup;
+        // Send acknowledgment to client
+        std::string response = forwarded ? 
+            "OK,Message delivered to " + toGroup :
+            "OK,Message queued for " + toGroup;
         sendCommand(clientSocket, response);
         logMessage("Sent: " + response);
     }
