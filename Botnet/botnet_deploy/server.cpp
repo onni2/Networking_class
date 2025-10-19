@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -16,934 +15,724 @@
 #include <vector>
 #include <set>
 #include <pthread.h>
+#include <algorithm>
+#include <signal.h>
 
 const std::string MY_GROUP_ID = "A5_1";
 const std::string TSAM_SERVER_IP = "130.208.246.98";
 const std::vector<int> INSTRUCTOR_PORTS = {5001, 5002, 5003};
+const int MAX_HOPS = 48;
 
-// Structure to hold information about connected servers
-struct ServerInfo
-{
+struct Message {
+    std::string content, fromGroup, toGroup, hops;
+    time_t timestamp;
+    int hopCount;
+};
+
+struct ServerInfo {
     int socket;
-    std::string groupId;
-    std::string ip;
+    std::string groupId, ip;
     int port;
-    time_t lastSeen;
-    bool isOutgoing; // true if we initiated connection
+    time_t lastSeen, connectedSince;
+    bool isOutgoing, isInstructor;
 };
 
-// Structure for servers we've heard about but aren't connected to
-struct KnownServer
-{
-    std::string groupId;
-    std::string ip;
+struct KnownServer {
+    std::string groupId, ip;
     int port;
-    time_t lastHeard; // When we last heard about this server
+    time_t lastHeard;
 };
 
-// Global data structures
-std::map<int, ServerInfo> connectedServers; // socket -> ServerInfo
-std::vector<KnownServer> knownServers;      // Servers we've learned about
-std::set<std::string> connectedGroupIds;    // Quick lookup of connected groups
-std::map<std::string, std::queue<std::string>> messageQueue;
+void* peerCommunicationThread(void* arg);
+
+std::map<int, ServerInfo> connectedServers;
+std::vector<KnownServer> knownServers;
+std::set<std::string> connectedGroupIds;
+std::map<std::string, std::queue<Message>> messageQueue;
 std::ofstream logFile;
 int listenPort;
 std::string myIpAddress;
 pthread_mutex_t serverMutex = PTHREAD_MUTEX_INITIALIZER;
-bool isScanning = false; // Prevent multiple simultaneous scans
+bool isScanning = false;
+int messagesReceived = 0, messagesSent = 0, messagesForwarded = 0, loopsDetected = 0;
 
-void logMessage(const std::string &message)
-{
-    std::string logEntry = "[" + getTimestamp() + "] " + message;
-    std::cout << logEntry << std::endl;
-    if (logFile.is_open())
-    {
-        logFile << logEntry << std::endl;
-        logFile.flush();
-    }
+std::map<std::string, time_t> lastHeloAttempt;
+
+void logMessage(const std::string &msg) {
+    std::string entry = "[" + getTimestamp() + "] " + msg;
+    std::cout << entry << std::endl;
+    if (logFile.is_open()) { logFile << entry << std::endl; logFile.flush(); }
 }
 
-// Get local IP address
-std::string getLocalIPAddress()
-{
-    // Try to get real external IP by connecting to external server
+std::string getLocalIPAddress() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        return "127.0.0.1";
-    }
-
-    // Connect to external server (doesn't actually send data)
-    // This determines which network interface would be used
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr("8.8.8.8"); // Google DNS
-    serv_addr.sin_port = htons(53);
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-    {
-        close(sock);
-        return "127.0.0.1";
-    }
-
-    // Get local address from the socket
-    struct sockaddr_in local_addr;
-    socklen_t addr_len = sizeof(local_addr);
-    if (getsockname(sock, (struct sockaddr *)&local_addr, &addr_len) < 0)
-    {
-        close(sock);
-        return "127.0.0.1";
-    }
-
+    if (sock < 0) return "127.0.0.1";
+    struct sockaddr_in serv;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_addr.s_addr = inet_addr("8.8.8.8");
+    serv.sin_port = htons(53);
+    if (connect(sock, (struct sockaddr *)&serv, sizeof(serv)) < 0) { close(sock); return "127.0.0.1"; }
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr *)&local, &len) < 0) { close(sock); return "127.0.0.1"; }
     close(sock);
-
-    // Convert to string
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &local_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-
-    return std::string(ip_str);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local.sin_addr, ip, INET_ADDRSTRLEN);
+    return std::string(ip);
 }
 
-int open_socket(int portno)
-{
-    struct sockaddr_in sk_addr;
-    int sock;
+int open_socket(int portno) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
     int set = 1;
-
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-    {
-        perror("Failed to open socket");
-        return -1;
-    }
-
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &set, sizeof(set)) < 0)
-    {
-        perror("Failed to set SO_REUSEADDR:");
-    }
-
-    memset(&sk_addr, 0, sizeof(sk_addr));
-    sk_addr.sin_family = AF_INET;
-    sk_addr.sin_addr.s_addr = INADDR_ANY;
-    sk_addr.sin_port = htons(portno);
-
-    if (bind(sock, (struct sockaddr *)&sk_addr, sizeof(sk_addr)) < 0)
-    {
-        perror("Failed to bind to socket:");
-        return -1;
-    }
-
-    return sock;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &set, sizeof(set));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(portno);
+    return bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0 ? -1 : sock;
 }
 
-// Forward declarations
 void triggerScan();
 
-// Connect to another server
-void connectToServer(const std::string &ip, int port)
-{
-    logMessage("Attempting to connect to " + ip + ":" + std::to_string(port));
-
-    // Check if already connected
+void connectToServer(const std::string &ip, int port) {
     pthread_mutex_lock(&serverMutex);
-    for (const auto &pair : connectedServers)
-    {
-        if (pair.second.ip == ip && pair.second.port == port)
-        {
+    for (const auto &p : connectedServers)
+        if (p.second.ip == ip && p.second.port == port) { pthread_mutex_unlock(&serverMutex); return; }
+    if (connectedServers.size() >= 8) { pthread_mutex_unlock(&serverMutex); return; }
+    pthread_mutex_unlock(&serverMutex);
+    
+    logMessage("Connecting to " + ip + ":" + std::to_string(port));
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) <= 0 || 
+        connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { 
+        logMessage("Failed to connect to " + ip + ":" + std::to_string(port));
+        close(sock); 
+        return; 
+    }
+    
+    if (!sendCommand(sock, buildHELO(MY_GROUP_ID))) { close(sock); return; }
+    
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    struct timeval tv = {10, 0};
+    if (select(sock + 1, &fds, NULL, NULL, &tv) <= 0) { close(sock); return; }
+    
+    std::string response;
+    if (!receiveCommand(sock, response)) { 
+        logMessage("No response from " + ip + ":" + std::to_string(port));
+        close(sock); 
+        return; 
+    }
+    logMessage("Got response: " + response.substr(0, 50));
+    std::vector<std::string> tokens = parseCommand(response);
+    if (tokens.empty()) { close(sock); return; }
+    
+    std::string responderId = "";
+    
+    if (tokens[0] == "HELO" && tokens.size() >= 2) {
+        responderId = tokens[1];
+        pthread_mutex_lock(&serverMutex);
+        if (connectedGroupIds.find(responderId) != connectedGroupIds.end()) {
             pthread_mutex_unlock(&serverMutex);
-            logMessage("Already connected to " + ip + ":" + std::to_string(port));
+            close(sock);
             return;
         }
+        pthread_mutex_unlock(&serverMutex);
+        
+        std::vector<std::tuple<std::string, std::string, int>> servers;
+        servers.push_back(std::make_tuple(MY_GROUP_ID, myIpAddress, listenPort));
+        pthread_mutex_lock(&serverMutex);
+        for (const auto &p : connectedServers)
+            if (!p.second.groupId.empty() && p.second.port > 0)  // Only share if we know their port
+                servers.push_back(std::make_tuple(p.second.groupId, p.second.ip, p.second.port));
+        pthread_mutex_unlock(&serverMutex);
+        
+        if (!sendCommand(sock, buildSERVERS(servers))) { close(sock); return; }
+        
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        tv.tv_sec = 10;
+        if (select(sock + 1, &fds, NULL, NULL, &tv) <= 0 || !receiveCommand(sock, response)) {
+            close(sock);
+            return;
+        }
+        tokens = parseCommand(response);
+        if (tokens.empty() || tokens[0] != "SERVERS") { close(sock); return; }
     }
-    pthread_mutex_unlock(&serverMutex);
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        logMessage("ERROR: Failed to create socket");
-        return;
-    }
-
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0)
-    {
-        logMessage("ERROR: Invalid address");
-        close(sock);
-        return;
-    }
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-    {
-        logMessage("ERROR: Connection failed to " + ip + ":" + std::to_string(port));
-        close(sock);
-        return;
-    }
-
-    logMessage("SUCCESS: Connected to " + ip + ":" + std::to_string(port));
-
-    // Send HELO
-    std::string helo = buildHELO(MY_GROUP_ID);
-    if (!sendCommand(sock, helo))
-    {
-        logMessage("ERROR: Failed to send HELO");
-        close(sock);
-        return;
-    }
-    logMessage("Sent: " + helo);
-
-    // Receive SERVERS response
-    std::string response;
-    if (receiveCommand(sock, response))
-    {
-        logMessage("Received: " + response);
-
-        // Parse SERVERS response to learn about their neighbors
-        std::vector<std::string> tokens = parseCommand(response);
-        if (tokens[0] == "SERVERS" && tokens.size() > 1)
-        {
-            pthread_mutex_lock(&serverMutex);
-
-            // Build server list string (skip "SERVERS" token)
-            std::string serverList;
-            for (size_t i = 1; i < tokens.size(); i++)
-            {
-                serverList += tokens[i];
-                if (i < tokens.size() - 1)
-                    serverList += ",";
-            }
-
-            // Split by semicolons
-            std::vector<std::string> serverEntries = splitServers(serverList);
-
-            for (const auto &entry : serverEntries)
-            {
-                std::vector<std::string> parts = parseCommand(entry);
-                if (parts.size() >= 3)
-                {
-                    KnownServer known;
-                    known.groupId = parts[0];
-                    known.ip = parts[1];
-                    known.port = std::stoi(parts[2]);
-                    known.lastHeard = time(nullptr);
-
-                    // Don't add ourselves or already connected servers
-                    if (known.groupId != MY_GROUP_ID &&
-                        connectedGroupIds.find(known.groupId) == connectedGroupIds.end())
-                    {
-
-                        // Check if already in known servers
-                        bool found = false;
-                        for (auto &existing : knownServers)
-                        {
-                            if (existing.groupId == known.groupId)
-                            {
-                                existing.lastHeard = time(nullptr); // Update timestamp
-                                existing.ip = known.ip;             // Update in case it changed
-                                existing.port = known.port;
-                                found = true;
-                                break;
-                            }
-                        }
-
-                        if (!found)
-                        {
-                            knownServers.push_back(known);
-                            logMessage("Learned about new server: " + known.groupId +
-                                       " at " + known.ip + ":" + std::to_string(known.port));
-                        }
+    
+    if (tokens[0] == "SERVERS" && tokens.size() > 1) {
+        pthread_mutex_lock(&serverMutex);
+        std::string serverList;
+        for (size_t i = 1; i < tokens.size(); i++) {
+            serverList += tokens[i];
+            if (i < tokens.size() - 1) serverList += ",";
+        }
+        std::vector<std::string> entries = splitServers(serverList);
+        if (responderId.empty() && !entries.empty()) {
+            std::vector<std::string> parts = parseCommand(entries[0]);
+            if (parts.size() >= 3) responderId = parts[0];
+        }
+        
+        // DON'T CONNECT TO SERVERS WITH OUR OWN GROUP ID!
+        if (responderId == MY_GROUP_ID) {
+            pthread_mutex_unlock(&serverMutex);
+            logMessage("Rejecting " + ip + ":" + std::to_string(port) + " - they claim to be " + responderId + " (our ID!)");
+            close(sock);
+            return;
+        }
+        
+        for (const auto &entry : entries) {
+            std::vector<std::string> parts = parseCommand(entry);
+            if (parts.size() >= 3) {
+                KnownServer ks = {parts[0], parts[1], std::stoi(parts[2]), time(nullptr)};
+                if (ks.groupId != MY_GROUP_ID && connectedGroupIds.find(ks.groupId) == connectedGroupIds.end()) {
+                    bool found = false;
+                    for (auto &e : knownServers) {
+                        if (e.groupId == ks.groupId) { e = ks; found = true; break; }
                     }
+                    if (!found) knownServers.push_back(ks);
                 }
             }
-
+        }
+        
+        if (connectedGroupIds.find(responderId) != connectedGroupIds.end()) {
             pthread_mutex_unlock(&serverMutex);
+            close(sock);
+            return;
         }
-
-        // Store this connection
-        pthread_mutex_lock(&serverMutex);
-        ServerInfo info;
-        info.socket = sock;
-        info.ip = ip;
-        info.port = port;
-        info.groupId = ""; // Will be filled from their messages
-        info.lastSeen = time(nullptr);
-        info.isOutgoing = true;
-        connectedServers[sock] = info;
+        
+        bool isInstr = false;
+        for (int p : INSTRUCTOR_PORTS) if (port == p && ip == TSAM_SERVER_IP) { isInstr = true; break; }
+        
+        connectedServers[sock] = {sock, responderId, ip, port, time(nullptr), time(nullptr), true, isInstr};
+        connectedGroupIds.insert(responderId);
         pthread_mutex_unlock(&serverMutex);
-    }
-    else
-    {
-        logMessage("ERROR: Failed to receive SERVERS response");
-        close(sock);
-    }
+        
+        logMessage("Connected to " + responderId + " [" + std::to_string(connectedServers.size()) + " total]");
+        
+        int* ptr = new int(sock);
+        pthread_t tid;
+        if (pthread_create(&tid, nullptr, peerCommunicationThread, ptr) == 0) {
+            pthread_detach(tid);
+        } else {
+            delete ptr;
+            pthread_mutex_lock(&serverMutex);
+            connectedServers.erase(sock);
+            connectedGroupIds.erase(responderId);
+            pthread_mutex_unlock(&serverMutex);
+            close(sock);
+        }
+    } else close(sock);
 }
 
-// Try connecting to known servers (fast recovery)
-void tryKnownServers()
-{
+void tryKnownServers() {
     pthread_mutex_lock(&serverMutex);
-    std::vector<KnownServer> candidates = knownServers;
-    int currentConnections = connectedServers.size();
+    std::vector<KnownServer> cands = knownServers;
     pthread_mutex_unlock(&serverMutex);
-
-    logMessage("Trying to connect to " + std::to_string(candidates.size()) +
-               " known servers");
-
-    for (const auto &server : candidates)
-    {
+    
+    for (const auto &s : cands) {
         pthread_mutex_lock(&serverMutex);
-        currentConnections = connectedServers.size();
-        bool alreadyConnected = (connectedGroupIds.find(server.groupId) !=
-                                 connectedGroupIds.end());
+        bool connected = connectedGroupIds.find(s.groupId) != connectedGroupIds.end();
+        bool full = connectedServers.size() >= 8;
         pthread_mutex_unlock(&serverMutex);
-
-        if (currentConnections >= 8)
-        {
-            logMessage("Max connections reached");
-            break;
-        }
-
-        if (!alreadyConnected)
-        {
-            connectToServer(server.ip, server.port);
-            sleep(1);
-        }
+        if (full) break;
+        if (!connected) { connectToServer(s.ip, s.port); sleep(2); }
     }
 }
 
-// Emergency scan when connections drop too low
-void triggerScan()
-{
+void triggerScan() {
     pthread_mutex_lock(&serverMutex);
-    if (isScanning)
-    {
-        pthread_mutex_unlock(&serverMutex);
-        logMessage("Scan already in progress, skipping");
-        return;
-    }
+    if (isScanning) { pthread_mutex_unlock(&serverMutex); return; }
     isScanning = true;
     pthread_mutex_unlock(&serverMutex);
-
-    logMessage("=== Emergency scan triggered ===");
-
-    // First try known servers (fast - just a few seconds)
+    
     tryKnownServers();
-
-    // Check if we now have enough connections
+    
     pthread_mutex_lock(&serverMutex);
-    int connections = connectedServers.size();
+    int conn = connectedServers.size();
     pthread_mutex_unlock(&serverMutex);
-
-    if (connections >= 3)
-    {
-        logMessage("✅ Sufficient connections after trying known servers");
+    
+    if (conn >= 3) {
         pthread_mutex_lock(&serverMutex);
         isScanning = false;
         pthread_mutex_unlock(&serverMutex);
         return;
     }
-
-    // Still not enough - do full port scan
-    logMessage("Not enough connections, performing full port scan");
-
-    std::vector<int> studentPorts = scanForServers(TSAM_SERVER_IP, 4000, 4200, listenPort);
-
-    logMessage("Found " + std::to_string(studentPorts.size()) + " student servers");
-
-    // Try to connect to discovered servers
-    for (int port : studentPorts)
-    {
+    
+    std::vector<int> ports = scanForServers(TSAM_SERVER_IP, 4000, 4200, listenPort);
+    for (int p : ports) {
         pthread_mutex_lock(&serverMutex);
-        int current = connectedServers.size();
+        if (connectedServers.size() >= 8) { pthread_mutex_unlock(&serverMutex); break; }
         pthread_mutex_unlock(&serverMutex);
-
-        if (current >= 8)
-            break;
-
-        connectToServer(TSAM_SERVER_IP, port);
-        sleep(1);
+        connectToServer(TSAM_SERVER_IP, p);
+        sleep(2);
     }
-
-    // Check instructor servers as last resort
+    
     pthread_mutex_lock(&serverMutex);
-    connections = connectedServers.size();
+    conn = connectedServers.size();
     pthread_mutex_unlock(&serverMutex);
-
-    if (connections < 3)
-    {
-        logMessage("Still below minimum, trying instructor servers");
-        for (int port : INSTRUCTOR_PORTS)
-        {
-            if (isPortOpen(TSAM_SERVER_IP, port, 500))
-            {
-                logMessage("Found instructor on port " + std::to_string(port));
-                connectToServer(TSAM_SERVER_IP, port);
-
+    
+    if (conn < 3) {
+        for (int p : INSTRUCTOR_PORTS) {
+            if (isPortOpen(TSAM_SERVER_IP, p, 500)) {
+                connectToServer(TSAM_SERVER_IP, p);
                 pthread_mutex_lock(&serverMutex);
-                if (connectedServers.size() >= 3)
-                {
-                    pthread_mutex_unlock(&serverMutex);
-                    break;
-                }
+                if (connectedServers.size() >= 3) { pthread_mutex_unlock(&serverMutex); break; }
                 pthread_mutex_unlock(&serverMutex);
-
-                sleep(1);
+                sleep(2);
             }
         }
     }
-
+    
     pthread_mutex_lock(&serverMutex);
     isScanning = false;
     pthread_mutex_unlock(&serverMutex);
-
-    logMessage("=== Emergency scan complete ===");
 }
 
-// Health monitor thread - checks connections periodically
-// Enhanced healthMonitorThread with proactive commands
-
-void *healthMonitorThread(void *arg)
-{
-    time_t lastKeepalive = time(nullptr);
-    time_t lastGetmsgs = time(nullptr);      
-    time_t lastStatusReq = time(nullptr);    
+void *healthMonitorThread(void *arg) {
+    (void)arg;
+    time_t lastKA = time(nullptr), lastGM = time(nullptr), lastSR = time(nullptr), lastCC = time(nullptr);
     
-    while (true)
-    {
-        sleep(30); // Check every 30 seconds
-
+    while (true) {
+        sleep(30);
         time_t now = time(nullptr);
         
-        // ===== Send KEEPALIVE every 60 seconds =====
-        if (now - lastKeepalive >= 60)
-        {
+        if (now - lastKA >= 60) {
             pthread_mutex_lock(&serverMutex);
-            
-            for (const auto &pair : connectedServers)
-            {
-                if (!pair.second.groupId.empty() && pair.second.isOutgoing)
-                {
-                    int msgCount = messageQueue[pair.second.groupId].size();
-                    std::string keepalive = buildKEEPALIVE(msgCount);
-                    
-                    if (sendCommand(pair.first, keepalive))
-                    {
-                        logMessage("Sent keepalive to " + pair.second.groupId + 
-                                  " (" + std::to_string(msgCount) + " msgs)");
+            int sent = 0;
+            std::vector<int> failed;
+            for (const auto &p : connectedServers) {
+                if (!p.second.groupId.empty()) {
+                    if (sendCommand(p.first, buildKEEPALIVE(messageQueue[p.second.groupId].size()))) {
+                        sent++;
+                    } else {
+                        failed.push_back(p.first);
                     }
                 }
             }
-            
+            for (int sock : failed) {
+                logMessage("Removing dead connection: " + connectedServers[sock].groupId);
+                std::string gid = connectedServers[sock].groupId;
+                connectedGroupIds.erase(gid);
+                lastHeloAttempt.erase(gid);
+                close(sock);
+                connectedServers.erase(sock);
+            }
             pthread_mutex_unlock(&serverMutex);
-            lastKeepalive = now;
+            if (sent > 0) logMessage("Sent KEEPALIVE to " + std::to_string(sent) + " peers");
+            lastKA = now;
         }
         
-        if (now - lastGetmsgs >= 90)
-        {
+        if (now - lastGM >= 90) {
             pthread_mutex_lock(&serverMutex);
-            
-            for (const auto &pair : connectedServers)
-            {
-                if (!pair.second.groupId.empty())
-                {
-                    std::string getmsgs = buildGETMSGS(MY_GROUP_ID);
-                    
-                    if (sendCommand(pair.first, getmsgs))
-                    {
-                        logMessage("Sent GETMSGS to " + pair.second.groupId);
+            int sent = 0;
+            std::vector<int> failed;
+            for (const auto &p : connectedServers) {
+                if (!p.second.groupId.empty()) {
+                    if (sendCommand(p.first, buildGETMSGS(MY_GROUP_ID))) {
+                        sent++;
+                    } else {
+                        failed.push_back(p.first);
                     }
                 }
             }
-            
+            for (int sock : failed) {
+                logMessage("Removing dead connection: " + connectedServers[sock].groupId);
+                std::string gid = connectedServers[sock].groupId;
+                connectedGroupIds.erase(gid);
+                lastHeloAttempt.erase(gid);
+                close(sock);
+                connectedServers.erase(sock);
+            }
             pthread_mutex_unlock(&serverMutex);
-            lastGetmsgs = now;
+            if (sent > 0) logMessage("Sent GETMSGS to " + std::to_string(sent) + " peers");
+            lastGM = now;
         }
         
-        if (now - lastStatusReq >= 180)
-        {
+        if (now - lastSR >= 180) {
             pthread_mutex_lock(&serverMutex);
-            
-            for (const auto &pair : connectedServers)
-            {
-                if (!pair.second.groupId.empty())
-                {
-                    std::string statusreq = buildSTATUSREQ();
-                    
-                    if (sendCommand(pair.first, statusreq))
-                    {
-                        logMessage("Sent STATUSREQ to " + pair.second.groupId);
+            int sent = 0;
+            std::vector<int> failed;
+            for (const auto &p : connectedServers) {
+                if (!p.second.groupId.empty()) {
+                    if (sendCommand(p.first, buildSTATUSREQ())) {
+                        sent++;
+                    } else {
+                        failed.push_back(p.first);
                     }
                 }
             }
-            
+            for (int sock : failed) {
+                logMessage("Removing dead connection: " + connectedServers[sock].groupId);
+                std::string gid = connectedServers[sock].groupId;
+                connectedGroupIds.erase(gid);
+                lastHeloAttempt.erase(gid);
+                close(sock);
+                connectedServers.erase(sock);
+            }
             pthread_mutex_unlock(&serverMutex);
-            lastStatusReq = now;
+            if (sent > 0) logMessage("Sent STATUSREQ to " + std::to_string(sent) + " peers");
+            lastSR = now;
         }
-
+        
         pthread_mutex_lock(&serverMutex);
-
-        // Clean up dead connections
         std::vector<int> toRemove;
-
-        for (auto &pair : connectedServers)
-        {
-            if (now - pair.second.lastSeen > 180)
-            {
-                logMessage("Connection timeout: " + pair.second.groupId);
-                toRemove.push_back(pair.first);
-            }
+        for (auto &p : connectedServers)
+            if (now - p.second.lastSeen > 300)
+                toRemove.push_back(p.first);
+        for (int s : toRemove) {
+            std::string gid = connectedServers[s].groupId;
+            connectedGroupIds.erase(gid);
+            lastHeloAttempt.erase(gid);
+            close(s);
+            connectedServers.erase(s);
         }
-
-        for (int sock : toRemove)
-        {
-            connectedGroupIds.erase(connectedServers[sock].groupId);
-            close(sock);
-            connectedServers.erase(sock);
-        }
-
-        int connections = connectedServers.size();
+        
+        int conn = connectedServers.size(), stuConn = 0, insConn = 0;
+        for (const auto &p : connectedServers)
+            p.second.isInstructor ? insConn++ : stuConn++;
         pthread_mutex_unlock(&serverMutex);
-
-        logMessage("Health check: " + std::to_string(connections) + " active connections");
-
-        if (connections < 3)
-        {
-            logMessage("Below minimum connections (" + std::to_string(connections) +
-                       "/3), triggering discovery");
-            triggerScan();
+        
+        logMessage("Status: " + std::to_string(conn) + " connections (" + std::to_string(stuConn) + 
+                   " students, " + std::to_string(insConn) + " instructors) | RX:" + std::to_string(messagesReceived) +
+                   " TX:" + std::to_string(messagesSent) + " FWD:" + std::to_string(messagesForwarded));
+        
+        if (now - lastCC >= 120) {
+            if (conn < 3) triggerScan();
+            else if (stuConn < 3 && conn < 8) tryKnownServers();
+            lastCC = now;
         }
     }
-
     return NULL;
 }
 
-// Handle commands from OTHER SERVERS
-void handleServerCommand(int clientSocket, const std::string &command)
-{
-    logMessage("Received from server: " + command);
-
-    std::vector<std::string> tokens = parseCommand(command);
-
-    if (tokens.empty())
-        return;
-
-    // Update last seen time
+void handleServerCommand(int sock, const std::string &cmd) {
+    std::string main, hops;
+    parseSENDMSGWithHops(cmd, main, hops);
+    std::vector<std::string> tokens = parseCommand(main);
+    if (tokens.empty()) return;
+    
     pthread_mutex_lock(&serverMutex);
-    if (connectedServers.find(clientSocket) != connectedServers.end())
-    {
-        connectedServers[clientSocket].lastSeen = time(nullptr);
-    }
+    if (connectedServers.find(sock) != connectedServers.end())
+        connectedServers[sock].lastSeen = time(nullptr);
     pthread_mutex_unlock(&serverMutex);
-
-    // Handle HELO from other servers
-    if (tokens[0] == "HELO" && tokens.size() >= 2)
-    {
-        std::string fromGroup = tokens[1];
-
+    
+    if (tokens[0] == "HELO" && tokens.size() >= 2) {
+        std::string from = tokens[1];
+        logMessage("HELO from " + from);
         pthread_mutex_lock(&serverMutex);
-        connectedServers[clientSocket].groupId = fromGroup;
-        connectedGroupIds.insert(fromGroup);
+        if (connectedGroupIds.find(from) != connectedGroupIds.end()) {
+            pthread_mutex_unlock(&serverMutex);
+            return;
+        }
+        if (connectedServers.find(sock) != connectedServers.end()) {
+            connectedServers[sock].groupId = from;
+            connectedGroupIds.insert(from);
+            logMessage("Accepted HELO from " + from + " [" + std::to_string(connectedGroupIds.size()) + " peers]");
+        } else { pthread_mutex_unlock(&serverMutex); return; }
         pthread_mutex_unlock(&serverMutex);
-
-        logMessage("Server " + fromGroup + " connected to us");
-
-        // Build SERVERS response with our neighbors
+        
         std::vector<std::tuple<std::string, std::string, int>> servers;
         servers.push_back(std::make_tuple(MY_GROUP_ID, myIpAddress, listenPort));
-
         pthread_mutex_lock(&serverMutex);
-        for (const auto &pair : connectedServers)
-        {
-            if (pair.first != clientSocket && !pair.second.groupId.empty())
-            {
-                servers.push_back(std::make_tuple(
-                    pair.second.groupId,
-                    pair.second.ip,
-                    pair.second.port));
-            }
-        }
+        for (const auto &p : connectedServers)
+            if (p.first != sock && !p.second.groupId.empty() && p.second.port > 0)  // Only share if we know their port
+                servers.push_back(std::make_tuple(p.second.groupId, p.second.ip, p.second.port));
         pthread_mutex_unlock(&serverMutex);
-
-        std::string response = buildSERVERS(servers);
-        sendCommand(clientSocket, response);
-        logMessage("Sent: " + response);
+        sendCommand(sock, buildSERVERS(servers));
     }
-    // Handle KEEPALIVE
-    else if (tokens[0] == "KEEPALIVE" && tokens.size() >= 2)
-    {
-        logMessage("Keepalive from " + connectedServers[clientSocket].groupId);
+    else if (tokens[0] == "KEEPALIVE" && tokens.size() >= 2) {
+        int cnt = std::stoi(tokens[1]);
+        pthread_mutex_lock(&serverMutex);
+        std::string from = connectedServers.find(sock) != connectedServers.end() ? connectedServers[sock].groupId : "?";
+        pthread_mutex_unlock(&serverMutex);
+        logMessage("KEEPALIVE from " + from + " (" + std::to_string(cnt) + " msgs)");
+        if (cnt > 0) sendCommand(sock, buildGETMSGS(MY_GROUP_ID));
     }
-    else if (tokens[0] == "GETMSGS" && tokens.size() >= 2)
-    {
+    else if (tokens[0] == "GETMSGS" && tokens.size() >= 2) {
         std::string forGroup = tokens[1];
-        
-        if (!messageQueue[forGroup].empty())
-        {
-            std::string msg = messageQueue[forGroup].front();
-            messageQueue[forGroup].pop();
-            
-            std::string response = buildSENDMSG(forGroup, MY_GROUP_ID, msg);
-            if (sendCommand(clientSocket, response))
-            {
-                logMessage("📤 Sent queued message to " + forGroup);
-            }
-        }
-        else
-        {
-            logMessage("📭 No messages for " + forGroup);
-        }
-    }
-    // Handle SENDMSG
-    else if (tokens[0] == "SENDMSG" && tokens.size() >= 4)
-    {
-        std::string toGroup = tokens[1];
-        std::string fromGroup = tokens[2];
-
-        std::string messageContent;
-        for (size_t i = 3; i < tokens.size(); i++)
-        {
-            messageContent += tokens[i];
-            if (i < tokens.size() - 1)
-                messageContent += ",";
-        }
-
-        // Check if message is for us
-        if (toGroup == MY_GROUP_ID)
-        {
-            messageQueue[toGroup].push(messageContent);
-            logMessage("Received message for us from " + fromGroup);
-        }
-        else
-        {
-            bool forwarded = false;
-            
+        logMessage("GETMSGS request for " + forGroup);
+        pthread_mutex_lock(&serverMutex);
+        bool has = !messageQueue[forGroup].empty();
+        pthread_mutex_unlock(&serverMutex);
+        if (has) {
             pthread_mutex_lock(&serverMutex);
-            
-            for (const auto &pair : connectedServers)
-            {
-                if (pair.second.groupId == toGroup)
-                {
+            Message msg = messageQueue[forGroup].front();
+            messageQueue[forGroup].pop();
+            pthread_mutex_unlock(&serverMutex);
+            sendCommand(sock, buildSENDMSG(forGroup, msg.fromGroup, msg.content, msg.hops));
+        } else sendCommand(sock, "NO_MESSAGES");
+    }
+    else if (tokens[0] == "SENDMSG" && tokens.size() >= 4) {
+        std::string to = tokens[1], from = tokens[2], content;
+        for (size_t i = 3; i < tokens.size(); i++) {
+            content += tokens[i];
+            if (i < tokens.size() - 1) content += ",";
+        }
+        
+        if (isInHops(hops, MY_GROUP_ID)) { 
+            loopsDetected++; 
+            logMessage("Loop detected, dropping msg (loops:" + std::to_string(loopsDetected) + ")");
+            return; 
+        }
+        
+        int hopCnt = 0;
+        if (!hops.empty()) {
+            hopCnt = 1;
+            for (char c : hops) if (c == ',') hopCnt++;
+        }
+        
+        if (hopCnt >= MAX_HOPS) {
+            Message msg = {content, from, to, "", time(nullptr), 0};
+            pthread_mutex_lock(&serverMutex);
+            messageQueue[to].push(msg);
+            pthread_mutex_unlock(&serverMutex);
+            return;
+        }
+        
+        if (to == MY_GROUP_ID) {
+            Message msg = {content, from, to, hops, time(nullptr), hopCnt};
+            pthread_mutex_lock(&serverMutex);
+            messageQueue[to].push(msg);
+            pthread_mutex_unlock(&serverMutex);
+            messagesReceived++;
+            logMessage("Received msg from " + from + " (hops:" + std::to_string(hopCnt) + ")");
+        } else {
+            bool fwd = false;
+            pthread_mutex_lock(&serverMutex);
+            for (const auto &p : connectedServers) {
+                if (p.second.groupId == to) {
                     pthread_mutex_unlock(&serverMutex);
-                    
-                    if (sendCommand(pair.first, command))
-                    {
-                        logMessage("Forwarded message from " + fromGroup + 
-                                  " to " + toGroup);
-                        forwarded = true;
+                    std::string newHops = hops.empty() ? from : hops + "," + MY_GROUP_ID;
+                    if (sendCommand(p.first, buildSENDMSG(to, from, content, newHops))) {
+                        messagesForwarded++;
+                        logMessage("Forwarded " + from + "->" + to + " [" + std::to_string(messagesForwarded) + "]");
+                        fwd = true;
                     }
-                    else
-                    {
-                        logMessage("Failed to forward message to " + toGroup);
-                    }
-                    
                     pthread_mutex_lock(&serverMutex);
                     break;
                 }
             }
-            
             pthread_mutex_unlock(&serverMutex);
             
-            if (!forwarded)
-            {
-                messageQueue[toGroup].push(messageContent);
-                logMessage("Stored message from " + fromGroup + " for " + toGroup + 
-                          " (not connected yet)");
+            if (!fwd) {
+                Message msg = {content, from, to, hops.empty() ? from : hops + "," + MY_GROUP_ID, time(nullptr), hopCnt + 1};
+                pthread_mutex_lock(&serverMutex);
+                messageQueue[to].push(msg);
+                for (const auto &p : connectedServers) {
+                    if (!p.second.groupId.empty() && !isInHops(msg.hops, p.second.groupId))
+                        sendCommand(p.first, buildSENDMSG(to, from, content, msg.hops));
+                }
+                pthread_mutex_unlock(&serverMutex);
             }
         }
     }
-    else if (tokens[0] == "STATUSREQ")
-    {
+    else if (tokens[0] == "STATUSREQ") {
+        logMessage("STATUSREQ received");
+        pthread_mutex_lock(&serverMutex);
         std::vector<std::pair<std::string, int>> status;
-        
-        for (const auto &pair : messageQueue)
-        {
-            if (!pair.second.empty())
-            {
-                status.push_back(std::make_pair(pair.first, pair.second.size()));
-            }
-        }
-        
-        std::string response = buildSTATUSRESP(status);
-        if (sendCommand(clientSocket, response))
-        {
-            logMessage("Sent status: " + response);
-        }
+        for (const auto &p : messageQueue)
+            if (!p.second.empty())
+                status.push_back({p.first, p.second.size()});
+        pthread_mutex_unlock(&serverMutex);
+        sendCommand(sock, buildSTATUSRESP(status));
+    }
+    else if (tokens[0] == "STATUSRESP") {
+        logMessage("STATUSRESP: " + main);
+    }
+    else if (tokens[0] == "NO_MESSAGES") {
+        logMessage("NO_MESSAGES from peer");
     }
 }
 
-// Handle commands from CLIENT
-void handleClientCommand(int clientSocket, const std::string &command)
-{
-    logMessage("Received from client: " + command);
-
-    std::vector<std::string> tokens = parseCommand(command);
-
-    if (tokens.empty())
-        return;
-
-    // Handle SENDMSG from client
-    if (tokens[0] == "SENDMSG" && tokens.size() >= 3)
-    {
-        std::string toGroup = tokens[1];
-        std::string message;
-        for (size_t i = 2; i < tokens.size(); i++)
-        {
-            message += tokens[i];
-            if (i < tokens.size() - 1)
-                message += ",";
+void handleClientCommand(int sock, const std::string &cmd) {
+    std::vector<std::string> tokens = parseCommand(cmd);
+    if (tokens.empty()) return;
+    
+    if (tokens[0] == "SENDMSG" && tokens.size() >= 3) {
+        std::string to = tokens[1], msg;
+        for (size_t i = 2; i < tokens.size(); i++) {
+            msg += tokens[i];
+            if (i < tokens.size() - 1) msg += ",";
         }
-
-        logMessage("Client wants to send message to " + toGroup + ": " + message);
-
-        // ✅ TRY TO FORWARD IMMEDIATELY
-        bool forwarded = false;
         
+        bool fwd = false;
         pthread_mutex_lock(&serverMutex);
-        
-        // Check if we're connected to destination
-        for (const auto &pair : connectedServers)
-        {
-            if (pair.second.groupId == toGroup)
-            {
+        for (const auto &p : connectedServers) {
+            if (p.second.groupId == to) {
                 pthread_mutex_unlock(&serverMutex);
-                
-                // Build proper SENDMSG command with FROM field
-                std::string forwardCmd = buildSENDMSG(toGroup, MY_GROUP_ID, message);
-                
-                if (sendCommand(pair.first, forwardCmd))
-                {
-                    logMessage("📬 Forwarded message to " + toGroup + " immediately");
-                    forwarded = true;
+                if (sendCommand(p.first, buildSENDMSG(to, MY_GROUP_ID, msg, MY_GROUP_ID))) {
+                    messagesSent++;
+                    fwd = true;
                 }
-                else
-                {
-                    logMessage("❌ Failed to forward to " + toGroup);
-                }
-                
                 pthread_mutex_lock(&serverMutex);
                 break;
             }
         }
-        
         pthread_mutex_unlock(&serverMutex);
         
-        // If not forwarded, store for later
-        if (!forwarded)
-        {
-            messageQueue[toGroup].push(message);
-            logMessage("📦 Stored message for " + toGroup + " (not connected)");
+        if (!fwd) {
+            Message m = {msg, MY_GROUP_ID, to, MY_GROUP_ID, time(nullptr), 1};
+            pthread_mutex_lock(&serverMutex);
+            messageQueue[to].push(m);
+            for (const auto &p : connectedServers)
+                if (!p.second.groupId.empty())
+                    sendCommand(p.first, buildSENDMSG(to, MY_GROUP_ID, msg, MY_GROUP_ID));
+            pthread_mutex_unlock(&serverMutex);
         }
-
-        // Send acknowledgment to client
-        std::string response = forwarded ? 
-            "OK,Message delivered to " + toGroup :
-            "OK,Message queued for " + toGroup;
-        sendCommand(clientSocket, response);
-        logMessage("Sent: " + response);
+        sendCommand(sock, fwd ? "OK,Delivered" : "OK,Queued");
     }
-    // Handle GETMSG from client
-    else if (tokens[0] == "GETMSG")
-    {
-        if (!messageQueue[MY_GROUP_ID].empty())
-        {
-            std::string msg = messageQueue[MY_GROUP_ID].front();
-            messageQueue[MY_GROUP_ID].pop();
-
-            std::string response = "SENDMSG," + MY_GROUP_ID + ",Unknown," + msg;
-            sendCommand(clientSocket, response);
-
-            logMessage("Delivered message to client: " + msg);
-        }
-        else
-        {
-            std::string response = "NO_MESSAGES";
-            sendCommand(clientSocket, response);
-            logMessage("No messages available");
-        }
-    }
-    // Handle LISTSERVERS from client
-    else if (tokens[0] == "LISTSERVERS")
-    {
+    else if (tokens[0] == "GETMSG") {
         pthread_mutex_lock(&serverMutex);
-
-        std::string response = "SERVERS," + MY_GROUP_ID + "," + myIpAddress + "," +
-                               std::to_string(listenPort);
-
-        // Add connected servers
-        for (const auto &pair : connectedServers)
-        {
-            if (!pair.second.groupId.empty())
-            {
-                response += ";" + pair.second.groupId + "," +
-                            pair.second.ip + "," + std::to_string(pair.second.port);
-            }
-        }
-
+        bool has = !messageQueue[MY_GROUP_ID].empty();
         pthread_mutex_unlock(&serverMutex);
-
-        sendCommand(clientSocket, response);
-        logMessage("Sent server list: " + response);
+        if (has) {
+            pthread_mutex_lock(&serverMutex);
+            Message msg = messageQueue[MY_GROUP_ID].front();
+            messageQueue[MY_GROUP_ID].pop();
+            pthread_mutex_unlock(&serverMutex);
+            sendCommand(sock, buildSENDMSG(MY_GROUP_ID, msg.fromGroup, msg.content));
+        } else sendCommand(sock, "NO_MESSAGES");
     }
-    else
-    {
-        logMessage("Unknown command: " + tokens[0]);
+    else if (tokens[0] == "LISTSERVERS") {
+        pthread_mutex_lock(&serverMutex);
+        std::vector<std::tuple<std::string, std::string, int>> list;
+        list.push_back(std::make_tuple(MY_GROUP_ID, myIpAddress, listenPort));
+        for (const auto &p : connectedServers)
+            if (!p.second.groupId.empty() && p.second.port > 0)  // Only show if we know their port
+                list.push_back(std::make_tuple(p.second.groupId, p.second.ip, p.second.port));
+        pthread_mutex_unlock(&serverMutex);
+        sendCommand(sock, buildSERVERS(list));
     }
 }
 
-int main(int argc, char *argv[])
-{
-    if (argc < 2)
-    {
-        printf("Usage: %s <port> [server_ip:port] ...\n", argv[0]);
-        printf("Example: %s 4044\n", argv[0]);
-        printf("Example: %s 4044 130.208.246.98:5001\n", argv[0]);
-        printf("\nThe server will:\n");
-        printf("  - Accept incoming connections from other servers\n");
-        printf("  - Learn about neighbors passively\n");
-        printf("  - Only scan when connections drop below 3\n");
-        exit(0);
+void *peerCommunicationThread(void *arg) {
+    int sock = *(int *)arg;
+    delete (int *)arg;
+    std::string cmd;
+    while (receiveCommand(sock, cmd)) {
+        handleServerCommand(sock, cmd);
+        pthread_mutex_lock(&serverMutex);
+        if (connectedServers.find(sock) != connectedServers.end())
+            connectedServers[sock].lastSeen = time(nullptr);
+        pthread_mutex_unlock(&serverMutex);
     }
+    pthread_mutex_lock(&serverMutex);
+    std::string gid;
+    if (connectedServers.find(sock) != connectedServers.end()) {
+        gid = connectedServers[sock].groupId;
+        connectedGroupIds.erase(gid);
+        connectedServers.erase(sock);
+        lastHeloAttempt.erase(gid); // Clean up rate limit tracking
+    }
+    pthread_mutex_unlock(&serverMutex);
+    if (!gid.empty()) logMessage("Peer " + gid + " disconnected");
+    close(sock);
+    return NULL;
+}
 
+int main(int argc, char *argv[]) {
+    if (argc < 2) { printf("Usage: %s <port> [--scan] [server_ip:port] ...\n", argv[0]); exit(0); }
+    
+    // Ignore SIGPIPE to prevent crashes on disconnected sockets
+    signal(SIGPIPE, SIG_IGN);
+    
     listenPort = atoi(argv[1]);
     myIpAddress = getLocalIPAddress();
-
-    // Open log file
-    std::string logFilename = MY_GROUP_ID + "_server.log";
-    logFile.open(logFilename, std::ios::app);
-
-    logMessage("========================================");
-    logMessage("Server starting: " + MY_GROUP_ID);
-    logMessage("Port: " + std::to_string(listenPort));
-    logMessage("IP: " + myIpAddress);
-    logMessage("Mode: REACTIVE DISCOVERY");
-    logMessage("========================================");
-
-    // Open listening socket
+    bool doScan = false;
+    
+    logFile.open(MY_GROUP_ID + "_server.log", std::ios::app);
+    logMessage("======================================");
+    logMessage("=== NEW SERVER INSTANCE STARTED ===");
+    logMessage("======================================");
+    logMessage("Server starting: " + MY_GROUP_ID + " on port " + std::to_string(listenPort));
+    
     int listenSock = open_socket(listenPort);
-    if (listenSock < 0)
-    {
-        logMessage("Failed to open listening socket");
-        exit(1);
-    }
-
-    if (listen(listenSock, 10) < 0)
-    {
-        logMessage("Listen failed on port " + std::to_string(listenPort));
-        exit(1);
-    }
-
-    logMessage("Server listening on port " + std::to_string(listenPort));
-
-    // Start health monitor thread
-    pthread_t healthThreadId;
-    if (pthread_create(&healthThreadId, NULL, healthMonitorThread, NULL) == 0)
-    {
-        pthread_detach(healthThreadId);
-        logMessage("Health monitor started");
-    }
-
-    // Connect to any servers specified on command line
-    for (int i = 2; i < argc; i++)
-    {
-        std::string serverAddr(argv[i]);
-        size_t colonPos = serverAddr.find(':');
-        if (colonPos != std::string::npos)
-        {
-            std::string ip = serverAddr.substr(0, colonPos);
-            int port = std::stoi(serverAddr.substr(colonPos + 1));
-
-            logMessage("Connecting to initial server: " + ip + ":" + std::to_string(port));
-            connectToServer(ip, port);
-            sleep(1);
+    if (listenSock < 0 || listen(listenSock, 10) < 0) exit(1);
+    
+    pthread_t hThread;
+    if (pthread_create(&hThread, NULL, healthMonitorThread, NULL) == 0) pthread_detach(hThread);
+    
+    for (int i = 2; i < argc; i++) {
+        std::string arg(argv[i]);
+        if (arg == "--scan") { doScan = true; continue; }
+        size_t pos = arg.find(':');
+        if (pos != std::string::npos) {
+            connectToServer(arg.substr(0, pos), std::stoi(arg.substr(pos + 1)));
+            sleep(2);
         }
     }
-
-    // Add some test messages for demo
-    messageQueue[MY_GROUP_ID].push("Welcome to the botnet!");
-    messageQueue[MY_GROUP_ID].push("Server is running in reactive mode");
-
-    logMessage("Waiting for connections...");
-
-    // Main accept loop
-    // Replace the main accept loop (around line 595-655) with this:
-
-    // Main accept loop
-    while (true)
-    {
-        struct sockaddr_in client;
-        socklen_t clientLen = sizeof(client);
-
-        int clientSock = accept(listenSock, (struct sockaddr *)&client, &clientLen);
-
-        if (clientSock < 0)
-        {
-            perror("Accept failed");
-            continue;
-        }
-
-        std::string clientIp = inet_ntoa(client.sin_addr);
-        int clientPort = ntohs(client.sin_port);
-
-        logMessage("Accepted connection from " + clientIp + ":" +
-                std::to_string(clientPort));
-
-        // Add to connected servers (will be identified by HELO)
+    
+    if (doScan) triggerScan();
+    else {
         pthread_mutex_lock(&serverMutex);
-        ServerInfo info;
-        info.socket = clientSock;
-        info.ip = clientIp;
-        info.port = 0;
-        info.groupId = "";
-        info.lastSeen = time(nullptr);
-        info.isOutgoing = false;
-        connectedServers[clientSock] = info;
-        pthread_mutex_unlock(&serverMutex);
-
-        // Receive first command
-        std::string command;
-        if (receiveCommand(clientSock, command))
-        {
-            std::vector<std::string> tokens = parseCommand(command);
-
-            if (!tokens.empty() && tokens[0] == "HELO")
-            {
-                // This is a server connecting to us
-                handleServerCommand(clientSock, command);
-                // Don't close - keep connection open for servers
-                logMessage("Peer server connection maintained");
-            }
-            else
-            {
-                // This is a client - handle first command
-                handleClientCommand(clientSock, command);
-                
-                // *** FIX: Loop to handle multiple commands from client ***
-                while (receiveCommand(clientSock, command))
-                {
-                    handleClientCommand(clientSock, command);
-                }
-                
-                // Close connection only when client disconnects
-                close(clientSock);
-                pthread_mutex_lock(&serverMutex);
-                connectedServers.erase(clientSock);
-                pthread_mutex_unlock(&serverMutex);
-                logMessage("Client connection closed");
-            }
-        }
-        else
-        {
-            logMessage("Failed to receive command or connection closed");
-            close(clientSock);
-            pthread_mutex_lock(&serverMutex);
-            connectedServers.erase(clientSock);
-            pthread_mutex_unlock(&serverMutex);
-        }
+        if (connectedServers.size() == 0) { pthread_mutex_unlock(&serverMutex); connectToServer(TSAM_SERVER_IP, 5001); }
+        else pthread_mutex_unlock(&serverMutex);
     }
-
+    
+    logMessage("Ready - listening for connections");
+    
+    while (true) {
+        struct sockaddr_in client;
+        socklen_t len = sizeof(client);
+        int cSock = accept(listenSock, (struct sockaddr *)&client, &len);
+        if (cSock < 0) continue;
+        
+        logMessage("Accepted connection from " + std::string(inet_ntoa(client.sin_addr)) + 
+                   ":" + std::to_string(ntohs(client.sin_port)));
+        
+        std::string cmd;
+        if (receiveCommand(cSock, cmd)) {
+            std::vector<std::string> tokens = parseCommand(cmd);
+            if (!tokens.empty() && tokens[0] == "HELO") {
+                pthread_mutex_lock(&serverMutex);
+                connectedServers[cSock] = {cSock, "", inet_ntoa(client.sin_addr), 0, time(nullptr), time(nullptr), false, false};
+                pthread_mutex_unlock(&serverMutex);
+                
+                handleServerCommand(cSock, cmd);
+                
+                // Check if HELO was accepted (socket still in connectedServers with groupId set)
+                pthread_mutex_lock(&serverMutex);
+                bool accepted = (connectedServers.find(cSock) != connectedServers.end() && 
+                                !connectedServers[cSock].groupId.empty());
+                pthread_mutex_unlock(&serverMutex);
+                
+                if (accepted) {
+                    pthread_t tid;
+                    int *ptr = new int(cSock);
+                    if (pthread_create(&tid, NULL, peerCommunicationThread, ptr) == 0) {
+                        pthread_detach(tid);
+                    } else {
+                        delete ptr;
+                        close(cSock);
+                        pthread_mutex_lock(&serverMutex);
+                        connectedServers.erase(cSock);
+                        pthread_mutex_unlock(&serverMutex);
+                    }
+                } else {
+                    // HELO was rejected, clean up
+                    close(cSock);
+                    pthread_mutex_lock(&serverMutex);
+                    connectedServers.erase(cSock);
+                    pthread_mutex_unlock(&serverMutex);
+                }
+            } else {
+                handleClientCommand(cSock, cmd);
+                while (receiveCommand(cSock, cmd)) handleClientCommand(cSock, cmd);
+                close(cSock);
+            }
+        } else close(cSock);
+    }
+    
     close(listenSock);
     logFile.close();
     return 0;

@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
             }
             
             // Client sends: SENDMSG,TO_GROUP,FROM_GROUP,message
-            std::string cmd = buildSENDMSG(toGroup, MY_GROUP_ID, message);
+            std::string cmd = "SENDMSG," + toGroup + "," + message;
             if(sendCommand(serverSocket, cmd)) {
                 logMessage("Sent: " + cmd);
                 
@@ -148,13 +148,12 @@ int main(int argc, char* argv[]) {
                         std::vector<std::string> respTokens = parseCommand(response);
                         if(respTokens[0] == "SENDMSG" && respTokens.size() >= 4) {
                             std::string toGroup = respTokens[1];
-                            std::string fromGroup = respTokens[2];
                             std::string message;
-                            for(size_t i = 3; i < respTokens.size(); i++) {
+                            for(size_t i = 2; i < respTokens.size(); i++) {
                                 message += respTokens[i];
                                 if(i < respTokens.size() - 1) message += ",";
                             }
-                            std::cout << "Message from " << fromGroup << ": " << message << std::endl;
+                            std::cout << "Message from " << ": " << message << std::endl;
                         } else {
                             std::cout << response << std::endl;
                         }
